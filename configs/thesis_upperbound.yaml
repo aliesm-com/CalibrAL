@@ -1,0 +1,57 @@
+# Thesis upper-bound: show >~90% is achievable on full IMDB test.
+# DistilBERT plateaued ~87.5% in local probes; bert-base clears 90%+.
+# budget=0 means no active-learning queries (supervised reference only).
+#
+# Claim this answers: "Is >90% achievable on IMDB with this codebase/model?"
+# It does NOT claim Active Learning labeled all 50k samples.
+profile: thesis_upperbound
+seed: 42
+# Probe with one seed first; restore [42, 43, 44] for the final thesis table.
+seeds: [42]
+
+data:
+  dataset_name: imdb
+  # Use nearly all of IMDB train (25k): val + labeled + tiny unused pool.
+  initial_labeled_size: 22500
+  pool_size: 500
+  validation_size: 2000
+  # Full official IMDB test split
+  test_size: 25000
+  # Character cap for cleaning only (tokenizer uses model.max_length).
+  max_text_length: 5000
+
+model:
+  name: bert-base-uncased
+  num_labels: 2
+  max_length: 512
+
+train:
+  epochs: 3
+  batch_size: 4
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+
+active_learning:
+  budget: 0
+  query_batch_size: 20
+  uncertainty: entropy
+  silver_threshold: 0.85
+  silver_weight: 0.5
+
+llm:
+  mode: api
+  provider: openai_compatible
+  base_url: https://openrouter.ai/api/v1
+  model: openai/gpt-4o-mini
+  api_key_env: OPENROUTER_API_KEY
+  timeout_seconds: 60
+  max_retries: 3
+  shot_mode: zero
+  prompt_version: v1
+  replay_path: null
+
+paths:
+  output_dir: outputs/thesis_upperbound
+  cache_dir: outputs/cache

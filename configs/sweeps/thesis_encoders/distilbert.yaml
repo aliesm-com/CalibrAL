@@ -1,0 +1,42 @@
+profile: thesis_al__distilbert
+seed: 42
+seeds:
+- 42
+data:
+  dataset_name: imdb
+  initial_labeled_size: 500
+  pool_size: 20000
+  validation_size: 2000
+  test_size: 25000
+  max_text_length: 5000
+model:
+  name: distilbert-base-uncased
+  num_labels: 2
+  max_length: 512
+train:
+  epochs: 3
+  batch_size: 8
+  learning_rate: 2.0e-05
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+active_learning:
+  budget: 1000
+  query_batch_size: 50
+  uncertainty: entropy
+  silver_threshold: 0.85
+  silver_weight: 0.5
+llm:
+  mode: api
+  provider: openai_compatible
+  base_url: https://openrouter.ai/api/v1
+  model: deepseek/deepseek-v3.2
+  api_key_env: OPENROUTER_API_KEY
+  timeout_seconds: 60
+  max_retries: 3
+  shot_mode: zero
+  prompt_version: v1
+  replay_path: null
+paths:
+  output_dir: outputs/bakeoff/encoders/distilbert
+  cache_dir: outputs/cache

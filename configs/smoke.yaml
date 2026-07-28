@@ -1,0 +1,48 @@
+profile: smoke
+
+seed: 42
+seeds: [42]
+
+data:
+  dataset_name: imdb
+  initial_labeled_size: 8
+  pool_size: 32
+  validation_size: 16
+  test_size: 16
+  max_text_length: 128
+
+model:
+  name: prajjwal1/bert-tiny
+  num_labels: 2
+  max_length: 128
+
+train:
+  epochs: 1
+  batch_size: 4
+  learning_rate: 5.0e-5
+  weight_decay: 0.01
+
+active_learning:
+  budget: 8
+  query_batch_size: 4
+  uncertainty: entropy
+  silver_threshold: 0.8
+  silver_weight: 0.5
+
+llm:
+  mode: mock
+  provider: openai_compatible
+  base_url: https://api.openai.com/v1
+  model: gpt-4o-mini
+  api_key_env: OPENAI_API_KEY
+  timeout_seconds: 30
+  max_retries: 2
+  shot_mode: zero
+  prompt_version: v1
+  replay_path: null
+
+paths:
+  output_dir: outputs/smoke
+  cache_dir: outputs/cache
+
+notes: NOT_SCIENTIFIC_SMOKE_RESULT

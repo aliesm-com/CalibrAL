@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -556,6 +557,24 @@ def build_experiment_figures(
         ),
     }
     return {k: str(v) if v else None for k, v in paths.items()}
+
+
+def sync_docs_thesis_figures(
+    experiment_output_dir: str | Path,
+    *,
+    project_root: str | Path | None = None,
+    bakeoff_root: str | Path = "outputs/bakeoff",
+) -> Path:
+    """Copy PNG figures into ``docs/thesis-figures/`` for README / GitHub rendering."""
+    root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
+    dest = root / "docs" / "thesis-figures"
+    dest.mkdir(parents=True, exist_ok=True)
+    for src_dir in (Path(experiment_output_dir) / "figures", Path(bakeoff_root) / "figures"):
+        if not src_dir.is_dir():
+            continue
+        for png in src_dir.glob("*.png"):
+            shutil.copy2(png, dest / png.name)
+    return dest
 
 
 def build_bakeoff_figures(bakeoff_root: str | Path = "outputs/bakeoff") -> dict[str, str | None]:

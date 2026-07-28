@@ -664,12 +664,13 @@ def build_report(
     summary = summarize_results(df)
     method_plot = plot_method_comparison(df, comparison_path)
     learning_plot = plot_learning_curve(df, learning_path)
-    from calibral.thesis_figures import build_bakeoff_figures, build_experiment_figures
+    from calibral.thesis_figures import build_bakeoff_figures, build_experiment_figures, sync_docs_thesis_figures
 
     thesis_figures = build_experiment_figures(output_dir, results_path=results_path)
     bakeoff_figures: dict[str, str | None] = {}
     if str(config.get("profile", "")).startswith("thesis"):
         bakeoff_figures = build_bakeoff_figures("outputs/bakeoff")
+        sync_docs_thesis_figures(output_dir)
     report_text = render_report_markdown(
         summary,
         results_path=str(results_path),

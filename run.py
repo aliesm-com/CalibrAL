@@ -246,13 +246,14 @@ def cmd_report(args: argparse.Namespace, config: dict[str, Any]) -> int:
 def cmd_figures(args: argparse.Namespace, config: dict[str, Any]) -> int:
     """Regenerate thesis plots from saved CSV/JSON (no GPU re-run)."""
     from calibral.config import resolve_output_dir
-    from calibral.thesis_figures import build_bakeoff_figures, build_experiment_figures
+    from calibral.thesis_figures import build_bakeoff_figures, build_experiment_figures, sync_docs_thesis_figures
 
     logger = get_logger("run")
     out = resolve_output_dir(config, create=True)
     logger.info("Building thesis figures from %s", out)
     exp = build_experiment_figures(out)
     bake = build_bakeoff_figures("outputs/bakeoff")
+    docs_dir = sync_docs_thesis_figures(out)
     print(f"Experiment figures: {out / 'figures'}")
     for name, path in exp.items():
         if path:
@@ -261,6 +262,7 @@ def cmd_figures(args: argparse.Namespace, config: dict[str, Any]) -> int:
     for name, path in bake.items():
         if path:
             print(f"  {name}: {path}")
+    print(f"README assets: {docs_dir}")
     return 0
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,16 +21,13 @@ from calibral.llm_labeler import (
     _read_api_key,
 )
 from calibral.reporting import build_report, format_duration
-from calibral.utils import describe_device, get_logger
+from calibral.utils import PROJECT_ROOT, describe_device, get_logger, load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _LLM_TO_INT = {"negative": LABEL_NEGATIVE, "positive": LABEL_POSITIVE}
 
 # LLM candidates for selection. Each model is evaluated once (not re-visited).
 LLM_CANDIDATES: list[str] = [
     "openai/gpt-4o-mini",
-    "openrouter/auto-beta",
-    "openrouter/auto",
     "google/gemma-4-31b-it:free",
     "qwen/qwen3.5-9b",
     "mistralai/ministral-3b-2512",
@@ -84,22 +80,6 @@ PROBE_TEXT = (
 )
 PROBE_GOLD_LABEL = LABEL_POSITIVE
 PROBE_GOLD_NAME = "positive"
-
-
-def load_dotenv(path: Path | None = None) -> None:
-    """Minimal .env loader (no extra dependency). Does not override existing env."""
-    env_path = path or (PROJECT_ROOT / ".env")
-    if not env_path.exists():
-        return
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        raw = line.strip()
-        if not raw or raw.startswith("#") or "=" not in raw:
-            continue
-        key, _, value = raw.partition("=")
-        key = key.strip()
-        value = value.strip().strip("'").strip('"')
-        if key and key not in os.environ:
-            os.environ[key] = value
 
 
 def bakeoff_root() -> Path:

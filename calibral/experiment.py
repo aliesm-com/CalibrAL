@@ -62,6 +62,12 @@ def _write_summary(output_dir: Path, summary: dict[str, Any]) -> Path:
     summary_path = output_dir / "run_summary.json"
     with summary_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2, ensure_ascii=False)
+    run_id = str(summary.get("run_id") or "unknown")
+    archive = output_dir / "run_summaries"
+    archive.mkdir(parents=True, exist_ok=True)
+    archived = archive / f"{run_id}.json"
+    with archived.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2, ensure_ascii=False)
     return summary_path
 
 
@@ -185,6 +191,7 @@ def _evaluate_and_record(
         "n_train": al_result["n_train_final"],
         "n_test": len(bundle.test),
         "rounds": al_result.get("rounds"),
+        "initial_train": al_result.get("initial_train"),
         "predictions_path": str(pred_path),
         "results_path": str(results_path),
         "finished_at": datetime.now(timezone.utc).isoformat(),

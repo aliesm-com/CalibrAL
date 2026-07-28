@@ -1,7 +1,11 @@
-# Thesis Active Learning setting on large IMDB slices.
-# Pool/test are large; human/LLM budget stays limited (AL point).
-# Goal: compare baseline vs proposed under a fixed human budget.
-profile: thesis_al
+# Thesis Active Learning setting on large IMDB slices (final, tuned for >93%).
+# Pool/test are large; human budget stays limited (AL point).
+# Encoder: roberta-base @512 (bert-base full-gold upper bound was ~92.97%;
+# roberta-base is the strongest BERT-family model on IMDB, ~94-95% supervised).
+# LLM: deepseek/deepseek-v3.2 (bakeoff winner, 19/20 on gold probe).
+# Large query_batch_size => most pool labels come as LLM silver labels,
+# so the model trains on ~8-10k samples while humans label only 1000.
+profile: thesis_al_silver
 seed: 42
 seeds: [42, 43, 44]
 
@@ -11,38 +15,52 @@ data:
   pool_size: 20000
   validation_size: 2000
   test_size: 25000
-  max_text_length: 512
+  # Character cap for cleaning only (tokenizer uses model.max_length).
+  max_text_length: 5000
 
 model:
-  name: distilbert-base-uncased
+  name: roberta-base
   num_labels: 2
-  max_length: 256
+  max_length: 512
 
 train:
   epochs: 3
-  batch_size: 16
+  # 512 tokens + roberta-base on 8GB VRAM => small batch.
+  batch_size: 4
   learning_rate: 2.0e-5
   weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
 
 active_learning:
   budget: 1000
-  query_batch_size: 50
+  # Big rounds: ~80% comes back as silver, so each round adds ~800 silver
+  # + ~100-200 gold. Budget lasts ~5-8 rounds => far fewer retrains too.
+  query_batch_size: 1000
   uncertainty: entropy
-  silver_threshold: 0.85
-  silver_weight: 0.5
+  # DeepSeek probe accuracy was 95% with mean confidence ~0.91:
+  # accept more silver and trust it more than the old 0.85/0.5 setting.
+  silver_threshold: 0.8
+  silver_weight: 0.8
+  # After the human budget runs out, DeepSeek labels this many random pool
+  # samples as extra silver data (random = easy = high acceptance/accuracy).
+  # Uncertainty picks alone left only ~2.7k train samples => 87.9% F1.
+  post_budget_silver: 8000
 
 llm:
   mode: api
   provider: openai_compatible
   base_url: https://openrouter.ai/api/v1
-  model: openai/gpt-4o-mini
+  model: deepseek/deepseek-v3.2
   api_key_env: OPENROUTER_API_KEY
   timeout_seconds: 60
   max_retries: 3
+  # Parallel API requests per AL round (cache hits are instant).
+  concurrency: 8
   shot_mode: zero
   prompt_version: v1
   replay_path: null
 
 paths:
-  output_dir: outputs/thesis_al
+  output_dir: outputs/thesis_al_silver
   cache_dir: outputs/cache

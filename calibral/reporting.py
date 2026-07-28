@@ -42,6 +42,14 @@ def _completed(df: pd.DataFrame) -> pd.DataFrame:
     return df[df["status"].astype(str).str.lower() == "completed"].copy()
 
 
+def dedupe_results(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per (method, seed): keep the last completed run in results.csv."""
+    completed = _completed(df)
+    if completed.empty:
+        return completed
+    return completed.drop_duplicates(subset=["method", "seed"], keep="last").copy()
+
+
 def format_duration(seconds: float | None) -> str:
     """Human-readable duration for summaries."""
     if seconds is None or (isinstance(seconds, float) and pd.isna(seconds)):
@@ -58,7 +66,7 @@ def format_duration(seconds: float | None) -> str:
 
 def summarize_results(df: pd.DataFrame) -> dict[str, Any]:
     """Aggregate metrics from a results dataframe (numbers only from CSV)."""
-    completed = _completed(df)
+    completed = dedupe_results(df)
     failed = df[df["status"].astype(str).str.lower() == "failed"].copy()
 
     methods: dict[str, Any] = {}
@@ -114,7 +122,7 @@ def summarize_results(df: pd.DataFrame) -> dict[str, Any]:
 
 def plot_method_comparison(df: pd.DataFrame, output_path: str | Path) -> Path | None:
     """Bar chart of Macro-F1 / Accuracy by method from completed runs."""
-    completed = _completed(df)
+    completed = dedupe_results(df)
     if completed.empty:
         return None
 
@@ -155,7 +163,7 @@ def plot_method_comparison(df: pd.DataFrame, output_path: str | Path) -> Path | 
 
 def plot_learning_curve(df: pd.DataFrame, output_path: str | Path) -> Path | None:
     """Learning-style curve: Macro-F1 vs human labels used, by method."""
-    completed = _completed(df)
+    completed = dedupe_results(df)
     if completed.empty:
         return None
 
@@ -407,6 +415,7 @@ def render_experiment_summary_markdown(
             f"- `{output_dir.as_posix()}/report.md` — longer report (after `report`)",
             f"- `{output_dir.as_posix()}/method_comparison.png`",
             f"- `{output_dir.as_posix()}/learning_curve.png`",
+            f"- `{output_dir.as_posix()}/figures/` — thesis-ready plots (after `report` or `figures`)",
             f"- `{output_dir.as_posix()}/comparison_summary.json`",
             f"- `{output_dir.as_posix()}/run_summary.json` — last single-run JSON",
             f"- `{output_dir.as_posix()}/predictions_*.csv`",
@@ -655,6 +664,12 @@ def build_report(
     summary = summarize_results(df)
     method_plot = plot_method_comparison(df, comparison_path)
     learning_plot = plot_learning_curve(df, learning_path)
+    from calibral.thesis_figures import build_bakeoff_figures, build_experiment_figures
+
+    thesis_figures = build_experiment_figures(output_dir, results_path=results_path)
+    bakeoff_figures: dict[str, str | None] = {}
+    if str(config.get("profile", "")).startswith("thesis"):
+        bakeoff_figures = build_bakeoff_figures("outputs/bakeoff")
     report_text = render_report_markdown(
         summary,
         results_path=str(results_path),
@@ -678,6 +693,8 @@ def build_report(
         "results_path": str(results_path),
         "method_comparison_path": str(method_plot) if method_plot else None,
         "learning_curve_path": str(learning_plot) if learning_plot else None,
+        "thesis_figures": thesis_figures,
+        "bakeoff_figures": bakeoff_figures,
     }
 
 

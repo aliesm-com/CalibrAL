@@ -85,7 +85,19 @@ def test_build_report_incomplete_without_csv(tmp_path: Path):
     assert "incomplete" in report.lower()
 
 
-def test_build_report_writes_plots(tmp_path: Path):
+def test_build_experiment_figures_from_csv(tmp_path: Path):
+    from calibral.thesis_figures import build_experiment_figures
+
+    csv_path = tmp_path / "results.csv"
+    sample = _sample_results()
+    sample["epochs"] = [1, 1, 1]
+    sample["n_al_rounds"] = [2, 2, 0]
+    sample["llm_labels_accepted"] = [0, 5, 0]
+    sample.to_csv(csv_path, index=False)
+    paths = build_experiment_figures(tmp_path, results_path=csv_path)
+    assert paths.get("macro_f1_by_seed")
+    assert Path(paths["macro_f1_by_seed"]).exists()
+
     csv_path = tmp_path / "results.csv"
     sample = _sample_results()
     sample["epochs"] = [1, 1, 1]

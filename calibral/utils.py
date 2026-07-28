@@ -3,11 +3,36 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
+from pathlib import Path
 from typing import Optional
 
 
 _LOGGING_CONFIGURED = False
+_DOTENV_LOADED = False
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_dotenv(path: Path | None = None) -> None:
+    """Minimal .env loader (no extra dependency). Does not override existing env."""
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED and path is None:
+        return
+    env_path = path or (PROJECT_ROOT / ".env")
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, _, value = raw.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'").strip('"')
+        if key and key not in os.environ:
+            os.environ[key] = value
+    if path is None:
+        _DOTENV_LOADED = True
 
 
 def setup_logging(level: int = logging.INFO, name: str = "calibral") -> logging.Logger:

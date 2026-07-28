@@ -9,6 +9,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -335,9 +336,11 @@ class APILLMLabeler(BaseLLMLabeler):
         timeout_seconds: float = 60.0,
         max_retries: int = 3,
         cache: ResponseCache | None = None,
+        concurrency: int = 8,
     ) -> None:
         if not api_key:
             raise MissingAPIKeyError("API key is empty.")
+        self.concurrency = max(1, int(concurrency))
         self.base_url = base_url.rstrip("/")
         self.model = model
         self._api_key = api_key
@@ -396,15 +399,65 @@ class APILLMLabeler(BaseLLMLabeler):
             except Exception as exc:  # noqa: BLE001 - retry transient/API/parse errors
                 last_error = exc
                 self.logger.warning(
-                    "API label attempt %d/%d failed: %s",
+                    "API label attempt %d/%d failed: %s: %s",
                     attempt,
                     attempts,
                     type(exc).__name__,
+                    str(exc)[:200],
                 )
                 if attempt < attempts:
                     time.sleep(min(2 ** (attempt - 1), 8))
 
         raise LLMLabelError(f"API labeling failed after {attempts} attempts: {last_error}")
+
+    def label_many(self, texts: list[str]) -> list[LLMLabelResult]:
+        """Label texts concurrently (cache hits stay instant, API calls overlap).
+
+        Results are returned in the same order as ``texts`` so the caller's
+        accounting is identical to the sequential path.
+        """
+        if len(texts) <= 1:
+            return [self.label_text(t) for t in texts]
+
+        results: list[LLMLabelResult | None] = [None] * len(texts)
+        done = 0
+        errors = 0
+        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            future_to_idx = {
+                executor.submit(self.label_text, text): idx
+                for idx, text in enumerate(texts)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                try:
+                    results[idx] = future.result()
+                except LLMLabelError as exc:
+                    # Never kill a multi-hour run over one stubborn sample:
+                    # confidence 0.0 routes it to the human oracle instead.
+                    errors += 1
+                    self.logger.warning(
+                        "LLM gave up on one sample (routed to human): %s",
+                        str(exc)[:200],
+                    )
+                    results[idx] = LLMLabelResult(
+                        label="negative",
+                        confidence=0.0,
+                        mode=self.mode,
+                        cached=False,
+                        source="error",
+                    )
+                done += 1
+                if done % 100 == 0 or done == len(texts):
+                    self.logger.info(
+                        "LLM labeling progress | %d/%d", done, len(texts)
+                    )
+        if errors:
+            self.logger.warning(
+                "LLM labeling finished with %d/%d failures (sent to human oracle)",
+                errors,
+                len(texts),
+            )
+        return results  # type: ignore[return-value]
 
     def _call_api(self, prompt: str) -> dict[str, Any]:
         url = f"{self.base_url}/chat/completions"
@@ -551,6 +604,7 @@ def create_labeler(
         timeout_seconds=float(llm_cfg.get("timeout_seconds", 60)),
         max_retries=int(llm_cfg.get("max_retries", 2)),
         cache=cache,
+        concurrency=int(llm_cfg.get("concurrency", 8)),
     )
 
 

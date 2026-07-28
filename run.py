@@ -10,10 +10,10 @@ from typing import Any
 
 from calibral import __project_name__, __version__
 from calibral.config import load_config
-from calibral.utils import describe_device, get_logger, setup_logging
+from calibral.utils import describe_device, get_logger, load_dotenv, setup_logging
 
 
-COMMANDS = ("smoke", "experiment", "report", "all", "sweep", "bakeoff")
+COMMANDS = ("smoke", "experiment", "report", "figures", "all", "sweep", "bakeoff")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +45,7 @@ def build_parser() -> argparse.ArgumentParser:
         "command",
         nargs="?",
         choices=COMMANDS,
-        help="Command to run: smoke | experiment | report | all | sweep | bakeoff",
+        help="Command to run: smoke | experiment | report | figures | all | sweep | bakeoff",
     )
     parser.add_argument(
         "--config",
@@ -234,7 +234,34 @@ def cmd_report(args: argparse.Namespace, config: dict[str, Any]) -> int:
     print(f"method_comparison: {result.get('method_comparison_path')}")
     print(f"learning_curve: {result.get('learning_curve_path')}")
     print(f"results: {result.get('results_path')}")
+    for name, path in (result.get("thesis_figures") or {}).items():
+        if path:
+            print(f"figure/{name}: {path}")
+    for name, path in (result.get("bakeoff_figures") or {}).items():
+        if path:
+            print(f"bakeoff/{name}: {path}")
     return 0 if result.get("status") in {"completed", "incomplete"} else 1
+
+
+def cmd_figures(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    """Regenerate thesis plots from saved CSV/JSON (no GPU re-run)."""
+    from calibral.config import resolve_output_dir
+    from calibral.thesis_figures import build_bakeoff_figures, build_experiment_figures
+
+    logger = get_logger("run")
+    out = resolve_output_dir(config, create=True)
+    logger.info("Building thesis figures from %s", out)
+    exp = build_experiment_figures(out)
+    bake = build_bakeoff_figures("outputs/bakeoff")
+    print(f"Experiment figures: {out / 'figures'}")
+    for name, path in exp.items():
+        if path:
+            print(f"  {name}: {path}")
+    print("Bakeoff figures: outputs/bakeoff/figures")
+    for name, path in bake.items():
+        if path:
+            print(f"  {name}: {path}")
+    return 0
 
 
 def cmd_sweep(args: argparse.Namespace, config: dict[str, Any]) -> int:
@@ -364,6 +391,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    load_dotenv()
     level = 10 if args.verbose else 20  # DEBUG / INFO
     setup_logging(level=level)
     logger = get_logger("run")
@@ -375,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     config_ref = args.config
     if config_ref is None and args.command == "smoke":
         config_ref = "smoke"
-    if config_ref is None and args.command in {"report", "all"}:
+    if config_ref is None and args.command in {"report", "all", "figures"}:
         # Prefer smoke unless the user explicitly passes --config.
         config_ref = "smoke"
     if args.command == "bakeoff":
@@ -412,6 +440,7 @@ def main(argv: list[str] | None = None) -> int:
         "smoke": cmd_smoke,
         "experiment": cmd_experiment,
         "report": cmd_report,
+        "figures": cmd_figures,
         "all": cmd_all,
         "sweep": cmd_sweep,
         "bakeoff": cmd_bakeoff,

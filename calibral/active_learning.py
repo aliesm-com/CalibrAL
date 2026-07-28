@@ -146,7 +146,7 @@ def run_proposed_active_learning(
     )
 
     model = _fresh_model()
-    train_model(
+    initial_train = train_model(
         model,
         tokenizer,
         labeled,
@@ -158,6 +158,7 @@ def run_proposed_active_learning(
     round_idx = 0
     while human_oracle_used < budget and len(pool) > 0:
         round_idx += 1
+        train_out = None
         k = min(query_batch_size, len(pool))
         selected = select_uncertain_ids(
             pool,
@@ -177,13 +178,15 @@ def run_proposed_active_learning(
         acquired_rows: list[dict[str, Any]] = []
         consumed_ids: list[str] = []
 
-        for _, row in selected.iterrows():
+        # Prefetch all LLM labels for this round concurrently (order preserved).
+        assert labeler is not None  # budget > 0 guarantees labeler
+        selected_texts = [str(t) for t in selected["text"].tolist()]
+        llm_results = labeler.label_many(selected_texts)
+        llm_calls += len(llm_results)
+
+        for (_, row), llm_result in zip(selected.iterrows(), llm_results):
             sample_id = str(row["sample_id"])
             text = str(row["text"])
-
-            assert labeler is not None  # budget > 0 guarantees labeler
-            llm_result = labeler.label_text(text)
-            llm_calls += 1
 
             if llm_result.confidence >= silver_threshold:
                 label = _LLM_TO_INT[llm_result.label]
@@ -231,7 +234,7 @@ def run_proposed_active_learning(
             )
 
             model = _fresh_model()
-            train_model(
+            train_out = train_model(
                 model,
                 tokenizer,
                 labeled,
@@ -251,10 +254,90 @@ def run_proposed_active_learning(
                 "llm_calls": llm_calls,
             }
         )
+        if acquired_rows and train_out is not None:
+            round_logs[-1]["n_train_after"] = train_out.get("n_train")
+            round_logs[-1]["best_val_macro_f1"] = train_out.get("best_val_macro_f1")
+            round_logs[-1]["epoch_history"] = train_out.get("history")
         logger.info("AL round %s", round_logs[-1])
 
         if not acquired_rows:
             break
+
+    # ------------------------------------------------------------------
+    # Post-budget silver expansion: once the human budget is exhausted,
+    # let the LLM annotate a large random slice of the remaining pool.
+    # Random samples are mostly "easy" (unlike the max-uncertainty picks),
+    # so LLM confidence/acceptance is high and the silver labels are clean.
+    # Humans are never queried here; only silver labels are added.
+    # ------------------------------------------------------------------
+    post_budget_silver = int(al_cfg.get("post_budget_silver", 0))
+    if post_budget_silver > 0 and labeler is not None and len(pool) > 0:
+        rng = np.random.default_rng(int(config.get("seed", 42)) + 1)
+        k = min(post_budget_silver, len(pool))
+        chosen = rng.choice(len(pool), size=k, replace=False)
+        selected = pool.iloc[np.sort(chosen)]
+        logger.info(
+            "Silver expansion start | requesting %d LLM labels from remaining pool (%d)",
+            k,
+            len(pool),
+        )
+        selected_texts = [str(t) for t in selected["text"].tolist()]
+        llm_results = labeler.label_many(selected_texts)
+        llm_calls += len(llm_results)
+
+        expansion_rows: list[dict[str, Any]] = []
+        consumed_ids = []
+        train_out = None
+        for (_, row), llm_result in zip(selected.iterrows(), llm_results):
+            if llm_result.confidence >= silver_threshold:
+                expansion_rows.append(
+                    {
+                        "sample_id": str(row["sample_id"]),
+                        "text": str(row["text"]),
+                        "label": _LLM_TO_INT[llm_result.label],
+                        "weight": silver_weight,
+                        "label_source": "silver",
+                        "llm_confidence": llm_result.confidence,
+                    }
+                )
+                llm_labels_accepted += 1
+                consumed_ids.append(str(row["sample_id"]))
+
+        if expansion_rows:
+            labeled = pd.concat(
+                [labeled, pd.DataFrame(expansion_rows)], ignore_index=True
+            )
+            pool = pool[
+                ~pool["sample_id"].astype(str).isin(consumed_ids)
+            ].reset_index(drop=True)
+            model = _fresh_model()
+            train_out = train_model(
+                model,
+                tokenizer,
+                labeled,
+                config=config,
+                device=device,
+                validation_df=bundle.validation,
+            )
+
+        round_idx += 1
+        round_logs.append(
+            {
+                "round": round_idx,
+                "queried": k,
+                "silver": len(expansion_rows),
+                "gold": 0,
+                "pool_remaining": len(pool),
+                "human_oracle_used": human_oracle_used,
+                "llm_calls": llm_calls,
+                "phase": "silver_expansion",
+            }
+        )
+        if expansion_rows and train_out is not None:
+            round_logs[-1]["n_train_after"] = train_out.get("n_train")
+            round_logs[-1]["best_val_macro_f1"] = train_out.get("best_val_macro_f1")
+            round_logs[-1]["epoch_history"] = train_out.get("history")
+        logger.info("Silver expansion done %s", round_logs[-1])
 
     human_labels_used = int(len(bundle.initial_labeled) + human_oracle_used)
     gold_total = int((labeled["label_source"] == "gold").sum())
@@ -273,6 +356,7 @@ def run_proposed_active_learning(
         "llm_calls": llm_calls,
         "llm_mode": llm_mode,
         "rounds": round_logs,
+        "initial_train": initial_train,
         "n_train_final": len(labeled),
     }
 

@@ -14,11 +14,87 @@ from calibral.reporting import _completed, dedupe_results, load_results
 METHOD_COLORS = {
     "baseline": "#4C72B0",
     "proposed": "#55A868",
+    "random_silver": "#DD8452",
+    "uncertainty_gold": "#8172B2",
+    "llm_distill": "#C44E52",
+    "llm_zeroshot": "#937860",
 }
 METHOD_LABELS = {
     "baseline": "Baseline (random AL)",
     "proposed": "Proposed (uncertainty + LLM silver)",
+    "random_silver": "Random AL + LLM silver",
+    "uncertainty_gold": "Uncertainty AL, humans only",
+    "llm_distill": "LLM-only distillation",
+    "llm_zeroshot": "LLM zero-shot (no classifier)",
 }
+METHOD_ORDER = list(METHOD_LABELS)
+
+
+def plot_all_methods(df: pd.DataFrame, output_path: Path) -> Path | None:
+    """Mean ± std Macro-F1 for every method in the experiment."""
+    data = dedupe_results(df)
+    if data.empty:
+        return None
+    methods = [m for m in METHOD_ORDER if m in set(data["method"])]
+    methods += [m for m in data["method"].unique() if m not in methods]
+    if len(methods) < 2:
+        return None
+    plt = _import_plt()
+    _apply_thesis_style(plt)
+    means = [float(data[data["method"] == m]["macro_f1"].mean()) * 100 for m in methods]
+    stds = [float(data[data["method"] == m]["macro_f1"].std(ddof=1) or 0) * 100 for m in methods]
+    fig, ax = plt.subplots(figsize=(9, max(3.5, 0.6 * len(methods))))
+    y = list(range(len(methods)))
+    ax.barh(
+        y, means, xerr=stds, capsize=4,
+        color=[METHOD_COLORS.get(m, "#999999") for m in methods],
+    )
+    ax.set_yticks(y)
+    ax.set_yticklabels([METHOD_LABELS.get(m, m) for m in methods])
+    lo = max(0.0, min(m - s for m, s in zip(means, stds)) - 2)
+    ax.set_xlim(lo, 100)
+    ax.set_xlabel("Test Macro-F1 (%) — mean ± std over seeds")
+    ax.set_title("All methods")
+    ax.grid(axis="x", linestyle="--", alpha=0.35)
+    ax.invert_yaxis()
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
+
+
+def plot_cost_vs_f1(df: pd.DataFrame, output_path: Path) -> Path | None:
+    """Total USD cost (human + LLM) vs Macro-F1, one point per method."""
+    data = dedupe_results(df)
+    if data.empty or "total_cost_usd" not in data.columns:
+        return None
+    data = data.copy()
+    data["total_cost_usd"] = pd.to_numeric(data["total_cost_usd"], errors="coerce")
+    data = data.dropna(subset=["total_cost_usd"])
+    if data.empty:
+        return None
+    plt = _import_plt()
+    _apply_thesis_style(plt)
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for method, sub in data.groupby("method"):
+        x = sub["total_cost_usd"].mean()
+        y = sub["macro_f1"].mean() * 100
+        ax.errorbar(
+            x, y,
+            xerr=sub["total_cost_usd"].std(ddof=1) if len(sub) > 1 else 0,
+            yerr=(sub["macro_f1"].std(ddof=1) * 100) if len(sub) > 1 else 0,
+            fmt="o", ms=8, capsize=4, color=METHOD_COLORS.get(method, "#999999"),
+            label=METHOD_LABELS.get(method, method),
+        )
+    ax.set_xlabel("Total labeling cost (USD): human training labels + LLM API")
+    ax.set_ylabel("Test Macro-F1 (%)")
+    ax.set_title("Cost vs quality")
+    ax.grid(linestyle="--", alpha=0.35)
+    ax.legend(fontsize=8, loc="lower right")
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+    return output_path
 
 
 def _import_plt():
@@ -480,7 +556,7 @@ def plot_bakeoff_llm_probe(bakeoff_root: Path, output_path: Path) -> Path | None
     ax.scatter(conf, list(y), color="#DD8452", s=70, zorder=3, label="Mean confidence (%)")
     ax.set_yticks(list(y))
     ax.set_yticklabels(models)
-    ax.set_xlabel("Percent on 20-sample gold probe")
+    ax.set_xlabel(f"Percent on {data.get('n_probe_samples', '?')}-sample gold probe")
     ax.set_title("LLM bakeoff: probe accuracy (bars) vs mean confidence (dots)")
     ax.set_xlim(0, 102)
     ax.grid(axis="x", linestyle="--", alpha=0.35)
@@ -510,7 +586,7 @@ def plot_bakeoff_llm_runtime(bakeoff_root: Path, output_path: Path) -> Path | No
     labels = [str(r["model"]).split("/")[-1][:24] for r in rows]
     times = [float(r["runtime_seconds"]) / 60.0 for r in rows]
     ax.barh(labels, times, color="#8172B2")
-    ax.set_xlabel("Wall-clock minutes (20 probe calls)")
+    ax.set_xlabel(f"Wall-clock minutes ({data.get('n_probe_samples', '?')} probe calls)")
     ax.set_title("LLM bakeoff: probe runtime")
     ax.grid(axis="x", linestyle="--", alpha=0.35)
     fig.tight_layout()
@@ -552,6 +628,8 @@ def build_experiment_figures(
             summaries, fig_dir / "al_validation_trajectory.png"
         ),
         "llm_utilization": plot_llm_utilization(df, fig_dir / "llm_utilization.png"),
+        "all_methods": plot_all_methods(df, fig_dir / "all_methods_macro_f1.png"),
+        "cost_vs_f1": plot_cost_vs_f1(df, fig_dir / "cost_vs_f1.png"),
         "confusion_proposed": plot_confusion_matrix(
             output_dir, fig_dir / "confusion_matrix_proposed.png", method="proposed"
         ),
@@ -564,10 +642,11 @@ def sync_docs_thesis_figures(
     *,
     project_root: str | Path | None = None,
     bakeoff_root: str | Path = "outputs/bakeoff",
+    docs_subdir: str = "thesis-figures",
 ) -> Path:
-    """Copy PNG figures into ``docs/thesis-figures/`` for README / GitHub rendering."""
+    """Copy PNG figures into ``docs/<docs_subdir>/`` for README / GitHub rendering."""
     root = Path(project_root) if project_root else Path(__file__).resolve().parent.parent
-    dest = root / "docs" / "thesis-figures"
+    dest = root / "docs" / docs_subdir
     dest.mkdir(parents=True, exist_ok=True)
     for src_dir in (Path(experiment_output_dir) / "figures", Path(bakeoff_root) / "figures"):
         if not src_dir.is_dir():

@@ -122,3 +122,104 @@ def test_create_labeler_mock_from_smoke_config():
     assert labeler.mode == "mock"
     result = labeler.label_text("An amazing movie with a weak ending.")
     assert result.label in {"positive", "negative"}
+
+
+# --- prompt v2 / robust parsing / request options -------------------------
+
+
+def test_prompt_v1_is_unchanged_for_reproducibility():
+    prompt = build_prompt("Target review", prompt_version="v1")
+    assert '{{"label"' in prompt
+
+
+def test_prompt_v2_has_single_brace_json_template():
+    prompt = build_prompt("Target review", prompt_version="v2")
+    assert "{{" not in prompt
+    assert '{"label"' in prompt
+    assert "Target review" in prompt
+
+
+def test_build_prompt_rejects_unknown_version():
+    with pytest.raises(ValueError):
+        build_prompt("x", prompt_version="v9")
+
+
+def test_validate_strips_think_block():
+    raw = '<think>The reviewer hated it.</think>\n{"label": "negative", "confidence": 0.9}'
+    assert validate_llm_response(raw) == ("negative", 0.9)
+
+
+def test_validate_handles_doubled_braces_from_v1_template():
+    raw = '{{"label": "positive", "confidence": 0.8}}'
+    assert validate_llm_response(raw) == ("positive", 0.8)
+
+
+def test_validate_handles_trailing_text_after_object():
+    raw = 'Sure! {"label": "positive", "confidence": 0.7} Hope this helps {:)'
+    assert validate_llm_response(raw) == ("positive", 0.7)
+
+
+def test_api_request_body_defaults_match_legacy():
+    from calibral.llm_labeler import APILLMLabeler
+
+    labeler = APILLMLabeler(base_url="http://x", model="m", api_key="k")
+    body = labeler._build_body("p", with_optional=True)
+    assert set(body) == {"model", "temperature", "messages"}
+
+
+def test_api_request_body_with_paper_options():
+    from calibral.llm_labeler import APILLMLabeler
+
+    labeler = APILLMLabeler(
+        base_url="http://x",
+        model="m",
+        api_key="k",
+        reasoning="off",
+        json_mode=True,
+        max_tokens=512,
+        seed=42,
+        extra_body={"provider": {"allow_fallbacks": False}},
+    )
+    body = labeler._build_body("p", with_optional=True)
+    assert body["reasoning"] == {"enabled": False}
+    assert body["response_format"] == {"type": "json_object"}
+    assert body["max_tokens"] == 512
+    assert body["seed"] == 42
+    assert body["provider"] == {"allow_fallbacks": False}
+    plain = labeler._build_body("p", with_optional=False)
+    assert "reasoning" not in plain and "response_format" not in plain
+
+
+def test_empty_content_raises_clear_error(monkeypatch):
+    from calibral.llm_labeler import APILLMLabeler
+
+    labeler = APILLMLabeler(base_url="http://x", model="m", api_key="k", max_retries=0)
+    monkeypatch.setattr(
+        labeler,
+        "_post",
+        lambda body: {"choices": [{"message": {"content": None}, "finish_reason": "length"}]},
+    )
+    with pytest.raises(LLMLabelError, match="Empty content"):
+        labeler.label_text("review")
+
+
+def test_probe_metrics_helpers():
+    from calibral.bakeoff import _calibration_metrics, _wilson_interval
+
+    lo, hi = _wilson_interval(19, 20)
+    assert 0.7 < lo < 0.95 < hi <= 1.0
+    records = [
+        {"pred": 1, "confidence": 1.0, "correct": True},
+        {"pred": 0, "confidence": 1.0, "correct": False},
+        {"pred": None, "confidence": None, "correct": False},
+    ]
+    metrics = _calibration_metrics(records)
+    assert metrics["brier"] == 0.5
+    assert metrics["ece"] == 0.5
+
+
+def test_paper_config_loads_with_bakeoff_section():
+    config = load_config("configs/paper_al.yaml")
+    assert config["llm"]["prompt_version"] == "v2"
+    assert config["bakeoff"]["n_probe_samples"] >= 100
+    assert all("~" not in m and "latest" not in m for m in config["bakeoff"]["llm_candidates"])

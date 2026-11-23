@@ -662,15 +662,33 @@ def build_report(
         raise ValueError(f"results.csv missing columns: {missing}")
 
     summary = summarize_results(df)
+    significance_path = None
+    try:
+        from calibral.significance import compute_significance
+
+        if compute_significance(output_dir) is not None:
+            significance_path = str(output_dir / "significance.md")
+    except Exception as exc:  # noqa: BLE001 - stats must never block the report
+        logger.warning("Significance computation failed: %s", exc)
     method_plot = plot_method_comparison(df, comparison_path)
     learning_plot = plot_learning_curve(df, learning_path)
     from calibral.thesis_figures import build_bakeoff_figures, build_experiment_figures, sync_docs_thesis_figures
 
     thesis_figures = build_experiment_figures(output_dir, results_path=results_path)
     bakeoff_figures: dict[str, str | None] = {}
-    if str(config.get("profile", "")).startswith("thesis"):
-        bakeoff_figures = build_bakeoff_figures("outputs/bakeoff")
-        sync_docs_thesis_figures(output_dir)
+    profile_name = str(config.get("profile", ""))
+    if profile_name.startswith(("thesis", "paper")):
+        from calibral.bakeoff import configure_bakeoff
+
+        bake_root = configure_bakeoff(config)
+        bakeoff_figures = build_bakeoff_figures(bake_root)
+        sync_docs_thesis_figures(
+            output_dir,
+            bakeoff_root=bake_root,
+            docs_subdir=str(
+                (config.get("paths") or {}).get("docs_figures_dir") or "thesis-figures"
+            ),
+        )
     report_text = render_report_markdown(
         summary,
         results_path=str(results_path),
@@ -691,6 +709,7 @@ def build_report(
         "summary": summary,
         "report_path": str(report_path),
         "experiment_summary_path": str(summary_md_path),
+        "significance_path": significance_path,
         "results_path": str(results_path),
         "method_comparison_path": str(method_plot) if method_plot else None,
         "learning_curve_path": str(learning_plot) if learning_plot else None,

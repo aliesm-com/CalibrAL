@@ -40,12 +40,26 @@ SHOT_EXAMPLES = [
     },
 ]
 
+# v1 is kept byte-identical so published runs (cached under prompt_version=v1)
+# stay reproducible. NOTE: v1 shows literal doubled braces "{{...}}" to the
+# model (the string is never .format()-ed); some small models copy that and
+# emit invalid JSON. Use v2 for new experiments.
 PROMPT_HEADER = (
     "You are a sentiment labeler for movie reviews.\n"
     "Classify the review as positive or negative.\n"
     "Respond with ONLY valid JSON of the form:\n"
     '{{"label": "positive"|"negative", "confidence": 0.0-1.0}}'
 )
+
+PROMPT_HEADER_V2 = (
+    "You are a sentiment labeler for {domain}.\n"
+    "Classify the review as positive or negative.\n"
+    "Respond with ONLY a single JSON object, no reasoning and no markdown, "
+    "of the form:\n"
+    '{"label": "positive" or "negative", "confidence": <number between 0 and 1>}'
+)
+
+PROMPT_HEADERS = {"v1": PROMPT_HEADER, "v2": PROMPT_HEADER_V2}
 
 
 def normalize_shot_mode(value: str | None) -> ShotMode:
@@ -82,17 +96,27 @@ def _format_example(example: dict[str, Any]) -> str:
     )
 
 
+DEFAULT_DOMAIN = "movie reviews"
+
+
 def build_prompt(
     text: str,
     prompt_version: str = "v1",
     shot_mode: str = "zero",
+    domain: str | None = None,
 ) -> str:
     """Build the user prompt for zero/one/multi-shot labeling."""
-    if prompt_version != "v1":
-        raise ValueError(f"Unsupported prompt_version: {prompt_version!r}")
+    if prompt_version not in PROMPT_HEADERS:
+        raise ValueError(
+            f"Unsupported prompt_version: {prompt_version!r}. "
+            f"Use one of {sorted(PROMPT_HEADERS)}."
+        )
 
     mode = normalize_shot_mode(shot_mode)
-    parts = [PROMPT_HEADER]
+    header = PROMPT_HEADERS[prompt_version]
+    if prompt_version != "v1":  # v1 stays byte-identical (movie reviews only)
+        header = header.replace("{domain}", domain or DEFAULT_DOMAIN)
+    parts = [header]
 
     if mode == "one":
         parts.append("\n\nExample:")
@@ -114,6 +138,15 @@ class LLMLabelResult:
     mode: str
     cached: bool = False
     source: str = "live"
+    # Filled for live API calls: the model/provider OpenRouter actually served.
+    served_model: str | None = None
+    provider: str | None = None
+    # Usage reported by the API (also restored from cache, so the cost of a
+    # label is attributable even when it was produced in an earlier run).
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    reasoning_tokens: int | None = None
+    cost_usd: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -152,8 +185,16 @@ def validate_llm_response(payload: Any) -> tuple[LabelName, float]:
     return label.lower().strip(), conf  # type: ignore[return-value]
 
 
+_THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+
+
 def _extract_json_object(text: str) -> dict[str, Any]:
-    text = text.strip()
+    text = _THINK_RE.sub("", text or "").strip()
+    # Unclosed <think> (truncated reasoning): keep only what follows it.
+    if "<think>" in text.lower():
+        text = re.split(r"</?think>", text, flags=re.IGNORECASE)[-1].strip()
+    # Models that copied the v1 template's literal "{{ ... }}".
+    text = text.replace("{{", "{").replace("}}", "}")
     try:
         data = json.loads(text)
         if isinstance(data, dict):
@@ -167,7 +208,18 @@ def _extract_json_object(text: str) -> dict[str, Any]:
 
     brace = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if brace:
-        return json.loads(brace.group(0))
+        try:
+            return json.loads(brace.group(0))
+        except json.JSONDecodeError:
+            pass
+    # Fallback: first flat {...} that parses (e.g. text after the object).
+    for match in re.finditer(r"\{[^{}]*\}", text):
+        try:
+            data = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict):
+            return data
 
     raise LLMLabelError(f"Could not parse JSON from LLM text: {text[:200]!r}")
 
@@ -337,7 +389,31 @@ class APILLMLabeler(BaseLLMLabeler):
         max_retries: int = 3,
         cache: ResponseCache | None = None,
         concurrency: int = 8,
+        reasoning: str | None = None,
+        max_tokens: int | None = None,
+        json_mode: bool = False,
+        seed: int | None = None,
+        extra_body: dict[str, Any] | None = None,
+        domain: str | None = None,
     ) -> None:
+        """
+        Optional request controls (all default to the legacy request body, so
+        old configs reproduce exactly):
+
+        - ``reasoning``: ``"off"`` sends OpenRouter ``reasoning.enabled=false``
+          (thinking models such as Qwen3.x / Gemma 4 otherwise spend the
+          token budget on hidden reasoning and may return empty ``content``);
+          ``"exclude"`` keeps reasoning but drops it from the response.
+        - ``max_tokens``: completion cap. Keep it generous (>=256) for models
+          whose reasoning cannot be disabled.
+        - ``json_mode``: sends ``response_format={"type": "json_object"}``.
+        - ``seed``: forwarded when the provider supports it.
+        - ``extra_body``: merged into the request, e.g. a pinned provider:
+          ``{"provider": {"order": ["deepinfra"], "allow_fallbacks": false}}``.
+
+        If the provider rejects an optional field (HTTP 400), the request is
+        retried once without ``response_format`` / ``reasoning``.
+        """
         if not api_key:
             raise MissingAPIKeyError("API key is empty.")
         self.concurrency = max(1, int(concurrency))
@@ -349,6 +425,17 @@ class APILLMLabeler(BaseLLMLabeler):
         self.timeout_seconds = float(timeout_seconds)
         self.max_retries = int(max_retries)
         self.cache = cache
+        self.reasoning = (str(reasoning).strip().lower() if reasoning else None)
+        if self.reasoning not in (None, "default", "off", "exclude"):
+            raise ValueError(
+                f"Unsupported llm.reasoning={reasoning!r}. Use off, exclude or default."
+            )
+        self.max_tokens = int(max_tokens) if max_tokens else None
+        self.json_mode = bool(json_mode)
+        self.seed = int(seed) if seed is not None else None
+        self.extra_body = dict(extra_body or {})
+        self._optional_fields_rejected = False
+        self.domain = domain
         self.logger = get_logger("llm")
         # Never log the key itself.
         self.logger.info(
@@ -371,16 +458,33 @@ class APILLMLabeler(BaseLLMLabeler):
                     mode=self.mode,
                     cached=True,
                     source="cache",
+                    served_model=cached.get("served_model"),
+                    provider=cached.get("provider"),
+                    prompt_tokens=cached.get("prompt_tokens"),
+                    completion_tokens=cached.get("completion_tokens"),
+                    reasoning_tokens=cached.get("reasoning_tokens"),
+                    cost_usd=cached.get("cost_usd"),
                 )
 
-        prompt = build_prompt(text, self.prompt_version, self.shot_mode)
+        prompt = build_prompt(
+            text, self.prompt_version, self.shot_mode, domain=self.domain
+        )
         last_error: Exception | None = None
         attempts = max(self.max_retries, 0) + 1
         for attempt in range(1, attempts + 1):
             try:
-                payload = self._call_api(prompt)
+                payload, meta = self._call_api_with_meta(prompt)
                 label, confidence = validate_llm_response(payload)
-                result_payload = {"label": label, "confidence": confidence}
+                result_payload = {
+                    "label": label,
+                    "confidence": confidence,
+                    "served_model": meta.get("served_model"),
+                    "provider": meta.get("provider"),
+                    "prompt_tokens": meta.get("prompt_tokens"),
+                    "completion_tokens": meta.get("completion_tokens"),
+                    "reasoning_tokens": meta.get("reasoning_tokens"),
+                    "cost_usd": meta.get("cost_usd"),
+                }
                 if self.cache is not None:
                     self.cache.set(
                         text,
@@ -395,6 +499,12 @@ class APILLMLabeler(BaseLLMLabeler):
                     mode=self.mode,
                     cached=False,
                     source="api",
+                    served_model=meta.get("served_model"),
+                    provider=meta.get("provider"),
+                    prompt_tokens=meta.get("prompt_tokens"),
+                    completion_tokens=meta.get("completion_tokens"),
+                    reasoning_tokens=meta.get("reasoning_tokens"),
+                    cost_usd=meta.get("cost_usd"),
                 )
             except Exception as exc:  # noqa: BLE001 - retry transient/API/parse errors
                 last_error = exc
@@ -406,7 +516,11 @@ class APILLMLabeler(BaseLLMLabeler):
                     str(exc)[:200],
                 )
                 if attempt < attempts:
-                    time.sleep(min(2 ** (attempt - 1), 8))
+                    # Rate limits (free endpoints) need a much longer pause.
+                    if "HTTP 429" in str(exc):
+                        time.sleep(min(10 * attempt, 60))
+                    else:
+                        time.sleep(min(2 ** (attempt - 1), 8))
 
         raise LLMLabelError(f"API labeling failed after {attempts} attempts: {last_error}")
 
@@ -459,9 +573,8 @@ class APILLMLabeler(BaseLLMLabeler):
             )
         return results  # type: ignore[return-value]
 
-    def _call_api(self, prompt: str) -> dict[str, Any]:
-        url = f"{self.base_url}/chat/completions"
-        body = {
+    def _build_body(self, prompt: str, *, with_optional: bool) -> dict[str, Any]:
+        body: dict[str, Any] = {
             "model": self.model,
             "temperature": 0,
             "messages": [
@@ -472,6 +585,26 @@ class APILLMLabeler(BaseLLMLabeler):
                 {"role": "user", "content": prompt},
             ],
         }
+        if self.max_tokens:
+            body["max_tokens"] = self.max_tokens
+        if self.seed is not None:
+            body["seed"] = self.seed
+        if with_optional:
+            if self.json_mode:
+                body["response_format"] = {"type": "json_object"}
+            if self.reasoning == "off":
+                body["reasoning"] = {"enabled": False}
+            elif self.reasoning == "exclude":
+                body["reasoning"] = {"exclude": True}
+        if "openrouter.ai" in self.base_url:
+            # Usage accounting: response.usage.cost in USD (no effect on output).
+            body["usage"] = {"include": True}
+        for key, value in self.extra_body.items():
+            body[key] = value
+        return body
+
+    def _post(self, body: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.base_url}/chat/completions"
         request = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -490,13 +623,69 @@ class APILLMLabeler(BaseLLMLabeler):
             raise LLMLabelError(f"HTTP {exc.code} from LLM API: {detail[:300]}") from exc
         except urllib.error.URLError as exc:
             raise LLMLabelError(f"LLM API connection error: {exc.reason}") from exc
-
         data = json.loads(raw)
+        # OpenRouter can return 200 with an error object.
+        if isinstance(data, dict) and data.get("error") and not data.get("choices"):
+            raise LLMLabelError(f"LLM API error: {str(data['error'])[:300]}")
+        return data
+
+    def _call_api_with_meta(self, prompt: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        has_optional = self.json_mode or self.reasoning in ("off", "exclude")
+        with_optional = has_optional and not self._optional_fields_rejected
         try:
-            content = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
+            data = self._post(self._build_body(prompt, with_optional=with_optional))
+        except LLMLabelError as exc:
+            if with_optional and str(exc).startswith("HTTP 400"):
+                self.logger.warning(
+                    "Provider rejected response_format/reasoning for %s; "
+                    "retrying without them for the rest of this run.",
+                    self.model,
+                )
+                self._optional_fields_rejected = True
+                data = self._post(self._build_body(prompt, with_optional=False))
+            else:
+                raise
+
+        try:
+            choice = data["choices"][0]
+            message = choice.get("message") or {}
+        except (KeyError, IndexError, TypeError, AttributeError) as exc:
             raise LLMLabelError(f"Unexpected API response shape: {str(data)[:300]}") from exc
-        return _extract_json_object(content)
+        content = message.get("content")
+        if isinstance(content, list):  # some providers return content parts
+            content = "".join(
+                str(part.get("text", "")) for part in content if isinstance(part, dict)
+            )
+        content = content or ""
+        if not content.strip():
+            reason = choice.get("finish_reason")
+            raise LLMLabelError(
+                "Empty content from LLM "
+                f"(finish_reason={reason!r}; reasoning model? try llm.reasoning=off "
+                "or a larger llm.max_tokens)"
+            )
+        usage = data.get("usage") or {}
+        details = usage.get("completion_tokens_details") or {}
+
+        def _num(value: Any, cast=float):
+            try:
+                return cast(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        meta = {
+            "served_model": data.get("model"),
+            "provider": data.get("provider"),
+            "prompt_tokens": _num(usage.get("prompt_tokens"), int),
+            "completion_tokens": _num(usage.get("completion_tokens"), int),
+            "reasoning_tokens": _num(details.get("reasoning_tokens"), int),
+            "cost_usd": _num(usage.get("cost")),
+        }
+        return _extract_json_object(content), meta
+
+    def _call_api(self, prompt: str) -> dict[str, Any]:
+        payload, _meta = self._call_api_with_meta(prompt)
+        return payload
 
 
 def _read_api_key(api_key_env: str) -> str | None:
@@ -605,7 +794,85 @@ def create_labeler(
         max_retries=int(llm_cfg.get("max_retries", 2)),
         cache=cache,
         concurrency=int(llm_cfg.get("concurrency", 8)),
+        domain=resolve_domain(config),
+        **api_request_options(llm_cfg),
     )
+
+
+def resolve_domain(config: dict[str, Any]) -> str:
+    """Text domain used in the v2 prompt ("movie reviews", "product reviews"...)."""
+    explicit = (config.get("llm") or {}).get("domain")
+    if explicit:
+        return str(explicit)
+    try:
+        from calibral.data import dataset_spec
+
+        name = (config.get("data") or {}).get("dataset_name", "imdb")
+        return dataset_spec(str(name)).domain
+    except Exception:  # noqa: BLE001
+        return DEFAULT_DOMAIN
+
+
+def summarize_llm_usage(
+    results: list["LLMLabelResult"],
+    *,
+    price_per_million_input: float | None = None,
+    price_per_million_output: float | None = None,
+) -> dict[str, Any]:
+    """Aggregate tokens and USD cost over labeling results.
+
+    Cached labels count with the usage stored when they were first produced,
+    so the reported cost is the attributable cost of every label a run used.
+    When the API did not report a cost but tokens are known, an optional
+    per-million price estimates it (``cost_estimated_calls``).
+    """
+    out: dict[str, Any] = {
+        "llm_results": len(results),
+        "llm_live_calls": sum(1 for r in results if r.source == "api"),
+        "llm_cache_hits": sum(1 for r in results if r.source == "cache"),
+        "llm_errors": sum(1 for r in results if r.source == "error"),
+        "llm_prompt_tokens": 0,
+        "llm_completion_tokens": 0,
+        "llm_reasoning_tokens": 0,
+        "llm_cost_usd": 0.0,
+        "llm_cost_known_calls": 0,
+        "llm_cost_estimated_calls": 0,
+        "llm_cost_unknown_calls": 0,
+    }
+    for r in results:
+        if r.source == "error":
+            continue
+        out["llm_prompt_tokens"] += int(r.prompt_tokens or 0)
+        out["llm_completion_tokens"] += int(r.completion_tokens or 0)
+        out["llm_reasoning_tokens"] += int(r.reasoning_tokens or 0)
+        if r.cost_usd is not None:
+            out["llm_cost_usd"] += float(r.cost_usd)
+            out["llm_cost_known_calls"] += 1
+        elif (
+            r.prompt_tokens is not None
+            and price_per_million_input is not None
+            and price_per_million_output is not None
+        ):
+            out["llm_cost_usd"] += (
+                float(r.prompt_tokens) * price_per_million_input
+                + float(r.completion_tokens or 0) * price_per_million_output
+            ) / 1e6
+            out["llm_cost_estimated_calls"] += 1
+        else:
+            out["llm_cost_unknown_calls"] += 1
+    out["llm_cost_usd"] = round(out["llm_cost_usd"], 6)
+    return out
+
+
+def api_request_options(llm_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Optional APILLMLabeler request controls read from an ``llm:`` config block."""
+    return {
+        "reasoning": llm_cfg.get("reasoning"),
+        "max_tokens": llm_cfg.get("max_tokens"),
+        "json_mode": bool(llm_cfg.get("json_mode", False)),
+        "seed": llm_cfg.get("seed"),
+        "extra_body": llm_cfg.get("extra_body"),
+    }
 
 
 def run_llm_smoke(config: dict[str, Any], texts: list[str] | None = None) -> dict[str, Any]:

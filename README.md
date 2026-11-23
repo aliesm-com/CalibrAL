@@ -221,6 +221,68 @@ English tables and runtime: `outputs/thesis_al_silver/experiment_summary.md`.
 3. Report mean ± std over seeds; attach figures from `figures/` and raw numbers from `results.csv`.
 4. Smoke/mock runs are pipeline tests only (`NOT_SCIENTIFIC_SMOKE_RESULT`).
 
+## Paper protocol (`configs/paper_al.yaml`)
+
+Same AL protocol as `thesis_al_silver`, with fixes for the paper's LLM comparison.
+Thesis artifacts, the thesis cache, and `prompt_version: v1` are left untouched, so the published thesis numbers stay reproducible.
+
+| Change | Why |
+|--------|-----|
+| `prompt_version: v2` | v1 shows the model a literal `{{"label": ...}}` template; some small models copy it and return invalid JSON |
+| `llm.reasoning: off`, `json_mode`, `max_tokens` | Thinking models (Qwen3.x, Gemma 4) otherwise return empty `content` or `<think>` blocks |
+| `bakeoff.n_probe_samples: 200` | 20 samples could not separate the top models (four tied at 19/20) |
+| Per-sample errors count as wrong | A single failed response no longer removes a whole model from the probe |
+| 95% Wilson CI, Brier, ECE per model | Supports the paper's statistical and calibration claims; ties broken by Brier |
+| Pinned snapshots only | `~...-latest` aliases silently change weights |
+| `outputs/paper_bakeoff/`, `configs/paper_al_final.yaml`, `docs/paper-figures/` | Separate from thesis outputs |
+
+```bash
+python run.py bakeoff --stage llm-probe --config configs/paper_al.yaml
+python run.py bakeoff --stage main      --config configs/paper_al.yaml
+python run.py figures --config configs/paper_al_final.yaml
+```
+
+### Methods (ablations, all on identical splits and seeds)
+
+| method | human labels | LLM | question it answers |
+|---|---|---|---|
+| `baseline` | 1,500 | no | thesis baseline (random AL) |
+| `uncertainty_gold` | 1,500 | no | is the LLM needed? |
+| `random_silver` | 1,500 | yes | is uncertainty sampling needed? |
+| `proposed` | 1,500 | yes | the method |
+| `llm_distill` | 0 | yes | are humans needed at all? |
+| `llm_zeroshot` | 0 | yes (on test) | why train a classifier instead of calling the LLM? |
+
+Set them with `experiment.methods`. Each run writes, besides `results.csv`/predictions:
+
+- `llm_labels_<method>_seed<seed>.csv`: every LLM answer with confidence, the AL phase
+  (`al_round` = high-entropy picks, `silver_expansion`/`distill` = random picks), whether it
+  was accepted as silver, and its correctness against the hidden gold label (evaluation only).
+  This is the data for the hard-vs-random / calibration analysis.
+- cost columns: `llm_cost_usd` (OpenRouter `usage.cost`, cached labels included),
+  token counts, `human_cost_usd` (`cost.human_per_label_usd` × training labels),
+  `total_cost_usd`, and `validation_gold_labels` reported separately.
+- `significance.md/json`: mean ± std per method, paired t-test/Wilcoxon over seeds and a
+  per-seed paired bootstrap (95% CI) of ΔMacro-F1 vs `baseline`.
+- figures: `all_methods_macro_f1.png`, `cost_vs_f1.png`.
+
+### Other datasets
+
+`data.dataset_name`: `imdb`, `sst2`, `yelp_polarity`, `amazon_polarity`, `rotten_tomatoes`
+(binary; the v2 prompt's text domain follows the dataset). Ready configs in `configs/paper/`
+use `llm.model: auto` (the IMDB probe winner):
+
+```bash
+python run.py experiment --config configs/paper/sst2.yaml
+python run.py experiment --config configs/paper/yelp_polarity.yaml
+python run.py experiment --config configs/paper/amazon_polarity.yaml
+python run.py experiment --config configs/paper/rotten_tomatoes.yaml
+```
+
+Per-sample probe answers (with the provider/model OpenRouter actually served) are written to
+`outputs/paper_bakeoff/llm_probe/predictions/<model>.jsonl`. For strict reproducibility you can
+pin a provider with `llm.extra_body.provider` (see the YAML).
+
 ## Model / LLM sweeps
 
 Classifier models:

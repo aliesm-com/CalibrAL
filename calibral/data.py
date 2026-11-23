@@ -1,4 +1,4 @@
-"""IMDB loading, cleaning, and deterministic train/pool/val/test splits."""
+"""Dataset loading (IMDB + other binary sentiment sets), cleaning, and splits."""
 
 from __future__ import annotations
 
@@ -18,6 +18,62 @@ from calibral.utils import get_logger
 LABEL_NEGATIVE = 0
 LABEL_POSITIVE = 1
 LABEL_NAMES = {LABEL_NEGATIVE: "negative", LABEL_POSITIVE: "positive"}
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    """How to load a binary sentiment dataset from the Hugging Face Hub.
+
+    Labels are mapped to 0=negative / 1=positive for every dataset.
+    Schemas checked against the Hub dataset cards (Nov 2026).
+    """
+
+    hf_id: str
+    hf_config: str | None
+    text_fields: tuple[str, ...]
+    label_field: str
+    train_split: str
+    test_split: str
+    domain: str
+    note: str = ""
+
+
+DATASETS: dict[str, DatasetSpec] = {
+    # 25k/25k long movie reviews. 0=neg, 1=pos.
+    "imdb": DatasetSpec("imdb", None, ("text",), "label", "train", "test", "movie reviews"),
+    # 67k short movie-review sentences. Public test labels are hidden (-1),
+    # so the 872-sample validation split is used as the test set.
+    "sst2": DatasetSpec(
+        "stanfordnlp/sst2", None, ("sentence",), "label", "train", "validation",
+        "movie review sentences",
+        note="test = official validation split (872); use data.test_size: all",
+    ),
+    # 560k/38k Yelp business reviews. Class names "1"/"2" = negative/positive.
+    "yelp_polarity": DatasetSpec(
+        "fancyzhx/yelp_polarity", None, ("text",), "label", "train", "test",
+        "business reviews (Yelp)",
+    ),
+    # 3.6M/400k Amazon product reviews; text = title + content.
+    "amazon_polarity": DatasetSpec(
+        "fancyzhx/amazon_polarity", None, ("title", "content"), "label", "train", "test",
+        "product reviews (Amazon)",
+    ),
+    # 8.5k/1k/1k movie-review snippets.
+    "rotten_tomatoes": DatasetSpec(
+        "cornell-movie-review-data/rotten_tomatoes", None, ("text",), "label",
+        "train", "test", "movie review snippets",
+        note="small: pool + validation + initial must fit in 8,530 train rows",
+    ),
+}
+
+
+def dataset_spec(name: str) -> DatasetSpec:
+    key = str(name or "imdb").strip().lower()
+    if key not in DATASETS:
+        raise ValueError(
+            f"Unknown data.dataset_name={name!r}. Available: {sorted(DATASETS)}"
+        )
+    return DATASETS[key]
+
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _BR_RE = re.compile(r"<br\s*/?>", flags=re.IGNORECASE)
@@ -109,7 +165,7 @@ def create_splits_from_frames(
     initial_labeled_size: int,
     pool_size: int,
     validation_size: int,
-    test_size: int,
+    test_size: int | str | None,
     seed: int,
     max_text_length: int | None = None,
 ) -> DataBundle:
@@ -128,7 +184,11 @@ def create_splits_from_frames(
 
     rng = np.random.default_rng(seed)
 
-    test, _ = _stratified_take(test_source, test_size, rng, "test")
+    if test_size is None or str(test_size).strip().lower() in {"all", "-1"}:
+        # Use the complete official test split (keeps its natural class ratio).
+        test = test_source.copy().reset_index(drop=True)
+    else:
+        test, _ = _stratified_take(test_source, int(test_size), rng, "test")
     validation, rest = _stratified_take(train, validation_size, rng, "validation")
     initial_labeled, rest = _stratified_take(
         rest, initial_labeled_size, rng, "initial_labeled"
@@ -197,6 +257,63 @@ def _assert_no_id_overlap(splits: dict[str, pd.DataFrame]) -> None:
             seen[sample_id] = split_name
 
 
+def load_dataset_frames(
+    dataset_name: str, cache_dir: str | Path
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Load any registered dataset as (train, test) frames: sample_id/text/label."""
+    spec = dataset_spec(dataset_name)
+    if spec.hf_id == "imdb":
+        return load_imdb_frames(cache_dir)
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    logger = get_logger("data")
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise ImportError(
+            "Missing dependency 'datasets'. Install with: pip install -r requirements.txt"
+        ) from exc
+
+    logger.info("Loading %s (%s) from Hugging Face...", dataset_name, spec.hf_id)
+    try:
+        dataset = load_dataset(spec.hf_id, spec.hf_config, cache_dir=str(cache_dir / "hf"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to download/load {spec.hf_id}. Check network access to "
+            f"Hugging Face. Original error: {exc}"
+        ) from exc
+
+    prefix = str(dataset_name).strip().lower()
+
+    def _to_frame(split_name: str) -> pd.DataFrame:
+        split = dataset[split_name]
+        columns = [list(split[f]) for f in spec.text_fields]
+        texts = [
+            ". ".join(str(part).strip() for part in parts if str(part or "").strip())
+            for parts in zip(*columns)
+        ]
+        frame = pd.DataFrame(
+            {
+                "sample_id": [f"{prefix}_{split_name}_{i}" for i in range(len(split))],
+                "text": texts,
+                "label": list(split[spec.label_field]),
+            }
+        )
+        bad = frame[~frame["label"].isin([LABEL_NEGATIVE, LABEL_POSITIVE])]
+        if len(bad):
+            raise ValueError(
+                f"{spec.hf_id}:{split_name} has {len(bad)} rows with labels outside "
+                "{0, 1} (hidden test labels?). Use another split as test."
+            )
+        return frame
+
+    train_df = _to_frame(spec.train_split)
+    test_df = _to_frame(spec.test_split)
+    logger.info("%s loaded: train=%d, test=%d", dataset_name, len(train_df), len(test_df))
+    return train_df, test_df
+
+
 def load_imdb_frames(cache_dir: str | Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Download/load IMDB via Hugging Face Datasets and return train/test frames."""
     cache_dir = Path(cache_dir)
@@ -255,8 +372,11 @@ def _cache_key(config: dict[str, Any]) -> str:
         f"i{int(data.get('initial_labeled_size', 0))}",
         f"p{int(data.get('pool_size', 0))}",
         f"v{int(data.get('validation_size', 0))}",
-        f"t{int(data.get('test_size', 0))}",
+        f"t{data.get('test_size', 0)}",
     ]
+    name = str(data.get("dataset_name", "imdb")).strip().lower()
+    if name != "imdb":  # keep existing IMDB cache keys unchanged
+        parts.insert(1, name)
     return "_".join(parts)
 
 
@@ -322,17 +442,19 @@ def prepare_data(
         logger.info("Loading cached splits from %s", split_dir)
         return load_data_bundle(split_dir)
 
-    if train_df is None or test_df is None:
-        train_df, test_df = load_imdb_frames(cache_dir)
-
     data_cfg = config.get("data", {})
+    if train_df is None or test_df is None:
+        train_df, test_df = load_dataset_frames(
+            str(data_cfg.get("dataset_name", "imdb")), cache_dir
+        )
+
     bundle = create_splits_from_frames(
         train_df,
         test_df,
         initial_labeled_size=int(data_cfg.get("initial_labeled_size", 0)),
         pool_size=int(data_cfg.get("pool_size", 0)),
         validation_size=int(data_cfg.get("validation_size", 0)),
-        test_size=int(data_cfg.get("test_size", 0)),
+        test_size=data_cfg.get("test_size", 0),
         seed=int(config.get("seed", 42)),
         max_text_length=data_cfg.get("max_text_length"),
     )

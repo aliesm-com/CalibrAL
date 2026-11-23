@@ -1,0 +1,119 @@
+# Paper setting: same AL protocol as thesis_al_silver, plus:
+#  - prompt v2 (fixes the literal "{{...}}" JSON template of v1),
+#  - reasoning disabled / JSON mode for "thinking" models (Qwen3.x, Gemma 4),
+#  - a larger 200-sample gold probe with 95% CIs + calibration (Brier/ECE),
+#  - pinned model snapshots only (no "~...-latest" aliases),
+#  - its own bakeoff folder + final config, so thesis artifacts stay untouched.
+#
+# Run:
+#   python run.py bakeoff --stage llm-probe --config configs/paper_al.yaml
+#   python run.py bakeoff --stage main      --config configs/paper_al.yaml
+#   python run.py figures --config configs/paper_al_final.yaml
+profile: paper_al_silver
+seed: 42
+# 5 seeds: needed for paired tests (see significance.md after the run).
+seeds: [42, 43, 44, 45, 46]
+
+experiment:
+  # Ablations isolate one factor each vs. "proposed":
+  #   baseline          random AL, humans only (thesis baseline)
+  #   uncertainty_gold  uncertainty AL, humans only       -> is the LLM needed?
+  #   random_silver     random AL + same LLM silver       -> is uncertainty needed?
+  #   llm_distill       LLM labels only, 0 human labels   -> are humans needed?
+  #   llm_zeroshot      LLM predicts the test set         -> why train a classifier?
+  methods: [baseline, uncertainty_gold, random_silver, proposed, llm_distill, llm_zeroshot]
+
+data:
+  dataset_name: imdb
+  initial_labeled_size: 500
+  pool_size: 20000
+  validation_size: 2000
+  test_size: 25000
+  max_text_length: 5000
+
+model:
+  name: roberta-base
+  num_labels: 2
+  max_length: 512
+
+train:
+  epochs: 3
+  batch_size: 4
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+
+active_learning:
+  budget: 1000
+  query_batch_size: 1000
+  uncertainty: entropy
+  silver_threshold: 0.8
+  silver_weight: 0.8
+  post_budget_silver: 8000
+
+distill:
+  # null = initial + budget + post_budget_silver (same training size the
+  # proposed method can reach). threshold defaults to silver_threshold.
+  size: null
+  include_initial_gold: false
+
+cost:
+  # PLACEHOLDER: replace with a rate you can cite (e.g. a published
+  # crowdsourcing / annotation-cost study) before reporting dollar figures.
+  # All raw counts are in results.csv, so costs can be recomputed later.
+  human_per_label_usd: 0.10
+  # Only used when the API does not return usage.cost (OpenRouter does).
+  llm_price_per_million_input: null
+  llm_price_per_million_output: null
+
+llm:
+  mode: api
+  provider: openai_compatible
+  base_url: https://openrouter.ai/api/v1
+  # Placeholder; replaced by the probe winner in configs/paper_al_final.yaml.
+  model: deepseek/deepseek-v3.2
+  api_key_env: OPENROUTER_API_KEY
+  timeout_seconds: 90
+  max_retries: 4
+  concurrency: 8
+  shot_mode: zero
+  prompt_version: v2
+  # Request controls (see APILLMLabeler docstring).
+  reasoning: "off"
+  json_mode: true
+  # Generous cap: covers providers that ignore reasoning=off.
+  max_tokens: 512
+  seed: 42
+  # Optional: pin the OpenRouter provider for reproducibility, e.g.
+  # extra_body:
+  #   provider:
+  #     order: ["deepinfra"]
+  #     allow_fallbacks: false
+  extra_body: null
+  replay_path: null
+
+bakeoff:
+  output_dir: outputs/paper_bakeoff
+  final_config: configs/paper_al_final.yaml
+  n_probe_samples: 200
+  llm_candidates:
+    # small / cheap tier
+    - mistralai/ministral-3b-2512
+    - qwen/qwen3.5-9b
+    - qwen/qwen3.5-35b-a3b
+    - qwen/qwen3.6-27b
+    - google/gemma-4-31b-it
+    - deepseek/deepseek-v4-flash-0731
+    - openai/gpt-4o-mini
+    # strong tier
+    - deepseek/deepseek-v3.2
+    - deepseek/deepseek-v4-pro-0813
+    - qwen/qwen3.7-plus
+    - openai/gpt-4o
+    - x-ai/grok-4.3
+
+paths:
+  output_dir: outputs/paper_al_silver
+  cache_dir: outputs/cache
+  docs_figures_dir: paper-figures

@@ -1,0 +1,76 @@
+# Yelp Polarity: business reviews (different domain, IMDB-like length).
+# Same protocol and methods as configs/paper_al.yaml (IMDB).
+# llm.model: auto = the probe winner from outputs/paper_bakeoff/best_llm.json
+# (run the IMDB probe first). The v2 prompt domain comes from the dataset registry.
+# Run: python run.py experiment --config configs/paper/yelp_polarity.yaml
+profile: paper_yelp_polarity
+seed: 42
+seeds:
+- 42
+- 43
+- 44
+- 45
+- 46
+experiment:
+  methods:
+  - baseline
+  - uncertainty_gold
+  - random_silver
+  - proposed
+  - llm_distill
+  - llm_zeroshot
+data:
+  dataset_name: yelp_polarity
+  initial_labeled_size: 500
+  pool_size: 20000
+  validation_size: 2000
+  test_size: 25000
+  max_text_length: 5000
+model:
+  name: roberta-base
+  num_labels: 2
+  max_length: 512
+train:
+  epochs: 3
+  batch_size: 4
+  learning_rate: 2.0e-05
+  weight_decay: 0.01
+  warmup_ratio: 0.1
+  max_grad_norm: 1.0
+active_learning:
+  budget: 1000
+  query_batch_size: 1000
+  uncertainty: entropy
+  silver_threshold: 0.8
+  silver_weight: 0.8
+  post_budget_silver: 8000
+distill:
+  size: null
+  include_initial_gold: false
+cost:
+  human_per_label_usd: 0.1
+  llm_price_per_million_input: null
+  llm_price_per_million_output: null
+llm:
+  mode: api
+  provider: openai_compatible
+  base_url: https://openrouter.ai/api/v1
+  model: auto
+  api_key_env: OPENROUTER_API_KEY
+  timeout_seconds: 90
+  max_retries: 4
+  concurrency: 8
+  shot_mode: zero
+  prompt_version: v2
+  reasoning: 'off'
+  json_mode: true
+  max_tokens: 512
+  seed: 42
+  extra_body: null
+  replay_path: null
+bakeoff:
+  output_dir: outputs/paper_bakeoff
+paths:
+  output_dir: outputs/paper_yelp_polarity
+  cache_dir: outputs/cache
+  docs_figures_dir: paper-figures/yelp_polarity

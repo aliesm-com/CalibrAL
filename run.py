@@ -62,7 +62,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Optional stage filter. For smoke: data|baseline|llm|proposed|all. "
-            "For bakeoff: llm-probe|write-configs|encoder-sweep|main|all."
+            "For bakeoff: llm-probe|probe-report|write-final|write-configs|encoder-sweep|main|all."
+        ),
+    )
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help="Override config seeds, comma-separated (e.g. 42 or 43,44,45,46).",
+    )
+    parser.add_argument(
+        "--methods",
+        default=None,
+        help=(
+            "Override experiment.methods, comma-separated "
+            "(baseline,uncertainty_gold,random_silver,proposed,llm_distill,llm_zeroshot)."
         ),
     )
     parser.add_argument(
@@ -211,6 +224,14 @@ def cmd_experiment(args: argparse.Namespace, config: dict[str, Any]) -> int:
             f"status={run.get('status')} macro_f1={run.get('macro_f1')} "
             f"llm_mode={run.get('llm_mode')}"
         )
+    if comparison.get("runtime_human"):
+        n_seeds = max(len(comparison.get("seeds") or []), 1)
+        print(
+            f"runtime: {comparison.get('runtime_human')} total "
+            f"(~{float(comparison.get('runtime_seconds') or 0) / n_seeds / 60:.0f} min per seed)"
+        )
+    if comparison.get("significance_path"):
+        print(f"significance: {comparison.get('significance_path')}")
     print(f"results: {comparison.get('results_path')}")
     print(f"comparison: {comparison.get('comparison_path')}")
     print(f"experiment_summary: {comparison.get('experiment_summary_path')}")
@@ -252,13 +273,22 @@ def cmd_figures(args: argparse.Namespace, config: dict[str, Any]) -> int:
     out = resolve_output_dir(config, create=True)
     logger.info("Building thesis figures from %s", out)
     exp = build_experiment_figures(out)
-    bake = build_bakeoff_figures("outputs/bakeoff")
-    docs_dir = sync_docs_thesis_figures(out)
+    from calibral.bakeoff import configure_bakeoff
+
+    bake_root = configure_bakeoff(config)
+    bake = build_bakeoff_figures(bake_root)
+    docs_dir = sync_docs_thesis_figures(
+        out,
+        bakeoff_root=bake_root,
+        docs_subdir=str(
+            (config.get("paths") or {}).get("docs_figures_dir") or "thesis-figures"
+        ),
+    )
     print(f"Experiment figures: {out / 'figures'}")
     for name, path in exp.items():
         if path:
             print(f"  {name}: {path}")
-    print("Bakeoff figures: outputs/bakeoff/figures")
+    print(f"Bakeoff figures: {bake_root / 'figures'}")
     for name, path in bake.items():
         if path:
             print(f"  {name}: {path}")
@@ -330,6 +360,7 @@ def cmd_all(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
 def cmd_bakeoff(args: argparse.Namespace, config: dict[str, Any]) -> int:
     from calibral.bakeoff import (
+        bakeoff_root,
         run_all,
         run_encoder_sweep,
         run_llm_probe,
@@ -340,11 +371,52 @@ def cmd_bakeoff(args: argparse.Namespace, config: dict[str, Any]) -> int:
     stage = args.stage or "all"
     config_path = args.config or "configs/thesis_al.yaml"
 
+    if stage == "write-final":
+        from calibral.bakeoff import apply_best_llm
+
+        path = apply_best_llm(config_path)
+        print(f"final config: {path}")
+        return 0
+
+    if stage == "probe-report":
+        from calibral.bakeoff import configure_bakeoff
+        from calibral.config import load_config
+        from calibral.probe_report import build_probe_report
+
+        root = configure_bakeoff(load_config(config_path))
+        path = build_probe_report(root)
+        if path is None:
+            print(f"No probe results under {root}. Run --stage llm-probe first.", file=sys.stderr)
+            return 1
+        print(f"report: {path}")
+        return 0
+
     if stage == "llm-probe":
         summary = run_llm_probe(config_path)
+        best = summary.get("best_row") or {}
+        print("")
+        print("=" * 64)
+        print(f"  PROBE RUN: {summary.get('run_stamp')}")
+        print(f"  WINNER: {summary.get('best_model')}")
+        if best:
+            ci = best.get("accuracy_ci95") or [None, None]
+            print(
+                f"  accuracy {100 * float(best['accuracy']):.1f}% "
+                + (f"(95% CI {100 * ci[0]:.1f}-{100 * ci[1]:.1f}%)" if ci[0] is not None else "")
+            )
+            print(f"  ECE {best.get('ece')} | $/1k labels {best.get('cost_per_1k_labels_usd')}")
+        print(
+            f"  completed {summary.get('n_completed')} / failed {summary.get('n_failed')} | "
+            f"total probe cost ${float(summary.get('total_cost_usd') or 0):.4f}"
+        )
+        print("=" * 64)
         print(f"best_llm={summary.get('best_model')}")
-        print("report: outputs/bakeoff/llm_probe/llm_probe_report.md")
-        print("best_json: outputs/bakeoff/best_llm.json")
+        stamp = summary.get("run_stamp")
+        print(f"report (this run): {bakeoff_root() / f'PROBE_REPORT_{stamp}.md'}")
+        print(f"report (latest):   {bakeoff_root() / 'PROBE_REPORT.md'}")
+        print(f"archive:           {bakeoff_root() / 'llm_probe' / 'history' / str(stamp)}")
+        print(f"details: {bakeoff_root() / 'llm_probe' / 'llm_probe_report.md'}")
+        print(f"best_json: {bakeoff_root() / 'best_llm.json'}")
         return 0 if summary.get("best_model") else 1
 
     if stage == "write-configs":
@@ -356,7 +428,7 @@ def cmd_bakeoff(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
     if stage == "encoder-sweep":
         summary = run_encoder_sweep(config_path)
-        print("report: outputs/bakeoff/bakeoff_report.md")
+        print(f"report: {bakeoff_root() / 'bakeoff_report.md'}")
         failed = sum(int(i.get("failed") or 0) for i in summary.get("items") or [])
         return 0 if failed == 0 else 1
 
@@ -376,14 +448,14 @@ def cmd_bakeoff(args: argparse.Namespace, config: dict[str, Any]) -> int:
         main = summary.get("main_experiment") or {}
         print(f"main_output: {main.get('output_dir')}")
         print(f"main_report: {main.get('report_path')}")
-        print("report: outputs/bakeoff/bakeoff_report.md")
+        print(f"report: {bakeoff_root() / 'bakeoff_report.md'}")
         failed = int((main.get("comparison") or {}).get("failed") or 0)
         ok = bool(summary["llm_probe"].get("best_model")) and failed == 0
         return 0 if ok else 1
 
     print(
         f"Unknown bakeoff stage: {stage!r}. "
-        "Use: llm-probe | write-configs | encoder-sweep | main | all",
+        "Use: llm-probe | probe-report | write-final | write-configs | encoder-sweep | main | all",
         file=sys.stderr,
     )
     return 2
@@ -426,6 +498,16 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("%s", exc)
         print(f"Config error: {exc}", file=sys.stderr)
         return 1
+
+    if args.seeds:
+        seeds = [int(x) for x in str(args.seeds).replace(" ", "").split(",") if x]
+        config["seeds"] = seeds
+        config["seed"] = seeds[0]
+        logger.info("Seeds overridden from CLI: %s", seeds)
+    if args.methods:
+        methods = [m for m in str(args.methods).replace(" ", "").split(",") if m]
+        config.setdefault("experiment", {})["methods"] = methods
+        logger.info("Methods overridden from CLI: %s", methods)
 
     device = describe_device()
     logger.info(

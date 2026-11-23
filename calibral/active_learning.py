@@ -9,7 +9,7 @@ import pandas as pd
 
 from calibral.data import LABEL_NEGATIVE, LABEL_POSITIVE, DataBundle
 from calibral.evaluation import predict
-from calibral.llm_labeler import create_labeler
+from calibral.llm_labeler import LLMLabelResult, create_labeler, summarize_llm_usage
 from calibral.model import build_model, move_model_to_device
 from calibral.trainer import train_model
 from calibral.utils import get_logger
@@ -87,14 +87,77 @@ def _ensure_weight_column(df: pd.DataFrame, default: float = 1.0) -> pd.DataFram
     return out
 
 
+def _usage_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    cost_cfg = config.get("cost") or {}
+    return {
+        "price_per_million_input": cost_cfg.get("llm_price_per_million_input"),
+        "price_per_million_output": cost_cfg.get("llm_price_per_million_output"),
+    }
+
+
+def _llm_record(
+    bundle: DataBundle,
+    sample_id: str,
+    result: LLMLabelResult,
+    *,
+    phase: str,
+    accepted: bool,
+    uncertainty: float | None = None,
+) -> dict[str, Any]:
+    """Evaluation-only log of one LLM answer (gold is never used for training)."""
+    gold = int(bundle.pool_labels.loc[sample_id])
+    pred = None if result.source == "error" else _LLM_TO_INT[result.label]
+    return {
+        "sample_id": sample_id,
+        "phase": phase,
+        "uncertainty": uncertainty,
+        "llm_label": pred,
+        "llm_confidence": float(result.confidence),
+        "llm_error": result.source == "error",
+        "accepted_as_silver": bool(accepted),
+        "gold_label": gold,
+        "llm_correct": (pred == gold) if pred is not None else False,
+        "provider": result.provider,
+        "served_model": result.served_model,
+    }
+
+
+def _silver_stats(records: list[dict[str, Any]]) -> dict[str, Any]:
+    accepted = [r for r in records if r["accepted_as_silver"]]
+    rejected = [r for r in records if not r["accepted_as_silver"] and not r["llm_error"]]
+    def _acc(rows):
+        return round(sum(1 for r in rows if r["llm_correct"]) / len(rows), 6) if rows else None
+    return {
+        # Precision of the labels that actually entered training as silver.
+        "silver_label_accuracy": _acc(accepted),
+        # LLM accuracy on answers routed to humans (below threshold): shows
+        # whether the confidence gate filters out the LLM's mistakes.
+        "rejected_llm_accuracy": _acc(rejected),
+        "llm_labeled_accuracy": _acc([r for r in records if not r["llm_error"]]),
+    }
+
+
 def run_proposed_active_learning(
     config: dict[str, Any],
     bundle: DataBundle,
     *,
     tokenizer,
     device: str,
+    selection: str = "uncertainty",
+    use_llm: bool = True,
 ) -> dict[str, Any]:
-    """Run the proposed hybrid AL loop and return model + accounting stats."""
+    """Run the hybrid AL loop and return model + accounting stats.
+
+    ``selection="uncertainty", use_llm=True`` is the proposed method.
+    Ablations reuse the same loop so only one factor changes:
+
+    - ``selection="random", use_llm=True``  -> random_silver (is uncertainty
+      sampling needed, given the same LLM silver mechanism?)
+    - ``selection="uncertainty", use_llm=False`` -> uncertainty_gold (classic
+      AL with humans only; is the LLM needed?)
+    """
+    if selection not in {"uncertainty", "random"}:
+        raise ValueError(f"Unknown selection={selection!r}")
     logger = get_logger("active_learning")
     al_cfg = config.get("active_learning", {})
     model_cfg = config.get("model", {})
@@ -115,9 +178,12 @@ def run_proposed_active_learning(
 
     labeler = None
     llm_mode = "none"
-    if budget > 0:
+    if budget > 0 and use_llm:
         labeler = create_labeler(config)
         llm_mode = labeler.mode
+    rng = np.random.default_rng(int(config.get("seed", 42)))
+    all_llm_results: list[LLMLabelResult] = []
+    llm_records: list[dict[str, Any]] = []
 
     labeled = _ensure_weight_column(bundle.initial_labeled, default=1.0)
     labeled["label_source"] = "gold"
@@ -159,17 +225,25 @@ def run_proposed_active_learning(
     while human_oracle_used < budget and len(pool) > 0:
         round_idx += 1
         train_out = None
-        k = min(query_batch_size, len(pool))
-        selected = select_uncertain_ids(
-            pool,
-            model,
-            tokenizer,
-            device=device,
-            max_length=max_length,
-            batch_size=batch_size,
-            k=k,
-            method=uncertainty,
-        )
+        if use_llm:
+            k = min(query_batch_size, len(pool))
+        else:  # humans only: never select more than the remaining budget
+            k = min(query_batch_size, budget - human_oracle_used, len(pool))
+        if selection == "uncertainty":
+            selected = select_uncertain_ids(
+                pool,
+                model,
+                tokenizer,
+                device=device,
+                max_length=max_length,
+                batch_size=batch_size,
+                k=k,
+                method=uncertainty,
+            )
+        else:
+            chosen = rng.choice(len(pool), size=k, replace=False)
+            selected = pool.iloc[np.sort(chosen)].reset_index(drop=True)
+            selected["uncertainty"] = np.nan
         if len(selected) == 0:
             break
 
@@ -179,16 +253,25 @@ def run_proposed_active_learning(
         consumed_ids: list[str] = []
 
         # Prefetch all LLM labels for this round concurrently (order preserved).
-        assert labeler is not None  # budget > 0 guarantees labeler
-        selected_texts = [str(t) for t in selected["text"].tolist()]
-        llm_results = labeler.label_many(selected_texts)
-        llm_calls += len(llm_results)
+        if labeler is not None:
+            selected_texts = [str(t) for t in selected["text"].tolist()]
+            llm_results: list[LLMLabelResult | None] = list(labeler.label_many(selected_texts))
+            llm_calls += len(llm_results)
+            all_llm_results.extend(r for r in llm_results if r is not None)
+        else:
+            llm_results = [None] * len(selected)
 
         for (_, row), llm_result in zip(selected.iterrows(), llm_results):
             sample_id = str(row["sample_id"])
             text = str(row["text"])
+            unc = row.get("uncertainty")
+            unc = None if unc is None or pd.isna(unc) else float(unc)
 
-            if llm_result.confidence >= silver_threshold:
+            if llm_result is not None and llm_result.confidence >= silver_threshold:
+                llm_records.append(
+                    _llm_record(bundle, sample_id, llm_result, phase="al_round",
+                                accepted=True, uncertainty=unc)
+                )
                 label = _LLM_TO_INT[llm_result.label]
                 acquired_rows.append(
                     {
@@ -209,6 +292,11 @@ def run_proposed_active_learning(
                 # Leave remaining selected items in the pool.
                 break
 
+            if llm_result is not None:
+                llm_records.append(
+                    _llm_record(bundle, sample_id, llm_result, phase="al_round",
+                                accepted=False, uncertainty=unc)
+                )
             gold = int(query_human_oracle(bundle, [sample_id]).iloc[0])
             human_oracle_used += 1
             acquired_rows.append(
@@ -218,7 +306,7 @@ def run_proposed_active_learning(
                     "label": gold,
                     "weight": 1.0,
                     "label_source": "gold",
-                    "llm_confidence": llm_result.confidence,
+                    "llm_confidence": llm_result.confidence if llm_result else None,
                 }
             )
             round_gold += 1
@@ -284,11 +372,19 @@ def run_proposed_active_learning(
         selected_texts = [str(t) for t in selected["text"].tolist()]
         llm_results = labeler.label_many(selected_texts)
         llm_calls += len(llm_results)
+        all_llm_results.extend(llm_results)
 
         expansion_rows: list[dict[str, Any]] = []
         consumed_ids = []
         train_out = None
         for (_, row), llm_result in zip(selected.iterrows(), llm_results):
+            llm_records.append(
+                _llm_record(
+                    bundle, str(row["sample_id"]), llm_result,
+                    phase="silver_expansion",
+                    accepted=llm_result.confidence >= silver_threshold,
+                )
+            )
             if llm_result.confidence >= silver_threshold:
                 expansion_rows.append(
                     {
@@ -358,6 +454,187 @@ def run_proposed_active_learning(
         "rounds": round_logs,
         "initial_train": initial_train,
         "n_train_final": len(labeled),
+        "llm_usage": summarize_llm_usage(all_llm_results, **_usage_kwargs(config)),
+        "llm_records": llm_records,
+        **_silver_stats(llm_records),
+    }
+
+
+def run_llm_distill_training(
+    config: dict[str, Any],
+    bundle: DataBundle,
+    *,
+    tokenizer,
+    device: str,
+) -> dict[str, Any]:
+    """LLM-only distillation baseline: no human labels in the training set.
+
+    The LLM labels ``distill.size`` random pool samples (default: the number
+    of training samples the proposed method can reach, i.e.
+    initial + budget + post_budget_silver). Labels below
+    ``distill.threshold`` (default: active_learning.silver_threshold; 0 keeps
+    all) are dropped. The classifier is trained once on the result.
+    ``distill.include_initial_gold: true`` adds the initial human seed set.
+    The gold validation split is still used for early stopping, exactly as in
+    every other method.
+    """
+    logger = get_logger("active_learning")
+    al_cfg = config.get("active_learning", {})
+    distill_cfg = config.get("distill") or {}
+    model_cfg = config.get("model", {})
+    default_size = (
+        len(bundle.initial_labeled)
+        + int(al_cfg.get("budget", 0))
+        + int(al_cfg.get("post_budget_silver", 0))
+    )
+    size = int(distill_cfg.get("size") or default_size)
+    threshold = float(
+        distill_cfg.get("threshold", al_cfg.get("silver_threshold", 0.8))
+    )
+    include_gold = bool(distill_cfg.get("include_initial_gold", False))
+
+    labeler = create_labeler(config)
+    pool = bundle.pool_features.copy().reset_index(drop=True)
+    rng = np.random.default_rng(int(config.get("seed", 42)) + 2)
+    k = min(size, len(pool))
+    selected = pool.iloc[np.sort(rng.choice(len(pool), size=k, replace=False))]
+    logger.info(
+        "LLM distill | labeling %d random pool samples | threshold=%.3f | "
+        "include_initial_gold=%s",
+        k,
+        threshold,
+        include_gold,
+    )
+    results = labeler.label_many([str(t) for t in selected["text"].tolist()])
+
+    rows: list[dict[str, Any]] = []
+    records: list[dict[str, Any]] = []
+    for (_, row), res in zip(selected.iterrows(), results):
+        accepted = res.source != "error" and res.confidence >= threshold
+        records.append(
+            _llm_record(bundle, str(row["sample_id"]), res, phase="distill", accepted=accepted)
+        )
+        if accepted:
+            rows.append(
+                {
+                    "sample_id": str(row["sample_id"]),
+                    "text": str(row["text"]),
+                    "label": _LLM_TO_INT[res.label],
+                    "weight": 1.0,
+                    "label_source": "silver",
+                    "llm_confidence": res.confidence,
+                }
+            )
+    labeled = pd.DataFrame(rows)
+    if include_gold:
+        gold = _ensure_weight_column(bundle.initial_labeled, default=1.0)
+        gold["label_source"] = "gold"
+        gold["weight"] = 1.0
+        labeled = pd.concat([gold, labeled], ignore_index=True)
+    if labeled.empty:
+        raise RuntimeError("LLM distillation produced no training labels.")
+
+    model = move_model_to_device(
+        build_model(str(model_cfg.get("name")), num_labels=int(model_cfg.get("num_labels", 2))),
+        device,
+    )
+    train_out = train_model(
+        model, tokenizer, labeled, config=config, device=device,
+        validation_df=bundle.validation,
+    )
+    n_gold = int((labeled["label_source"] == "gold").sum())
+    n_silver = int((labeled["label_source"] == "silver").sum())
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "labeled": labeled,
+        "human_labels_used": n_gold,
+        "human_oracle_used": 0,
+        "gold_labels_total": n_gold,
+        "llm_labels_accepted": n_silver,
+        "silver_labels_total": n_silver,
+        "llm_calls": len(results),
+        "llm_mode": labeler.mode,
+        "rounds": [
+            {
+                "round": 1,
+                "phase": "distill",
+                "queried": k,
+                "silver": n_silver,
+                "gold": n_gold,
+                "n_train_after": train_out.get("n_train"),
+                "best_val_macro_f1": train_out.get("best_val_macro_f1"),
+            }
+        ],
+        "initial_train": None,
+        "n_train_final": len(labeled),
+        "llm_usage": summarize_llm_usage(list(results), **_usage_kwargs(config)),
+        "llm_records": records,
+        **_silver_stats(records),
+    }
+
+
+def run_llm_zeroshot_test(config: dict[str, Any], bundle: DataBundle) -> dict[str, Any]:
+    """Label the test set directly with the LLM (no classifier is trained).
+
+    Answers that still fail after retries count as wrong. Also reports
+    selective accuracy/coverage at the silver threshold, i.e. how good the
+    LLM is on the subset it is confident about.
+    """
+    al_cfg = config.get("active_learning", {})
+    threshold = float(al_cfg.get("silver_threshold", 0.8))
+    labeler = create_labeler(config)
+    test = bundle.test.reset_index(drop=True)
+    results = labeler.label_many([str(t) for t in test["text"].tolist()])
+
+    true = test["label"].astype(int).tolist()
+    preds: list[int] = []
+    probs: list[float] = []
+    confident_correct = 0
+    confident_n = 0
+    n_errors = 0
+    for gold, res in zip(true, results):
+        if res.source == "error":
+            n_errors += 1
+            preds.append(1 - gold)  # failure counts as an error
+            probs.append(0.5)
+            continue
+        pred = _LLM_TO_INT[res.label]
+        preds.append(pred)
+        conf = float(res.confidence)
+        probs.append(conf if pred == LABEL_POSITIVE else 1.0 - conf)
+        if conf >= threshold:
+            confident_n += 1
+            confident_correct += int(pred == gold)
+    predictions = pd.DataFrame(
+        {
+            "sample_id": test["sample_id"].astype(str),
+            "true_label": true,
+            "pred_label": preds,
+            "prob_positive": probs,
+        }
+    )
+    return {
+        "model": None,
+        "tokenizer": None,
+        "predictions": predictions,
+        "human_labels_used": 0,
+        "human_oracle_used": 0,
+        "gold_labels_total": 0,
+        "llm_labels_accepted": 0,
+        "silver_labels_total": 0,
+        "llm_calls": len(results),
+        "llm_mode": labeler.mode,
+        "rounds": [],
+        "initial_train": None,
+        "n_train_final": 0,
+        "llm_usage": summarize_llm_usage(list(results), **_usage_kwargs(config)),
+        "llm_records": [],
+        "llm_test_errors": n_errors,
+        "llm_selective_coverage": round(confident_n / max(len(results), 1), 6),
+        "llm_selective_accuracy": round(confident_correct / confident_n, 6)
+        if confident_n
+        else None,
     }
 
 

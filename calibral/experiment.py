@@ -100,6 +100,186 @@ def _failed_row(
     }
 
 
+def _cost_columns(
+    config: dict[str, Any], bundle: DataBundle, al_result: dict[str, Any]
+) -> dict[str, Any]:
+    """USD accounting. Human cost uses ``cost.human_per_label_usd``.
+
+    ``human_cost_usd`` covers labels in the training set; the gold validation
+    split (identical for every method) is reported separately so it can be
+    included or excluded in the paper.
+    """
+    cost_cfg = config.get("cost") or {}
+    rate = cost_cfg.get("human_per_label_usd")
+    usage = al_result.get("llm_usage") or {}
+    human = al_result.get("human_labels_used")
+    n_val = len(bundle.validation)
+    llm_cost = usage.get("llm_cost_usd")
+    out: dict[str, Any] = {
+        "validation_gold_labels": n_val,
+        "llm_live_calls": usage.get("llm_live_calls"),
+        "llm_cache_hits": usage.get("llm_cache_hits"),
+        "llm_errors": usage.get("llm_errors"),
+        "llm_prompt_tokens": usage.get("llm_prompt_tokens"),
+        "llm_completion_tokens": usage.get("llm_completion_tokens"),
+        "llm_reasoning_tokens": usage.get("llm_reasoning_tokens"),
+        "llm_cost_usd": llm_cost if usage else 0.0,
+        "llm_cost_unknown_calls": usage.get("llm_cost_unknown_calls"),
+        "human_cost_usd": None,
+        "validation_cost_usd": None,
+        "total_cost_usd": None,
+    }
+    if rate is not None and human is not None:
+        rate = float(rate)
+        out["human_cost_usd"] = round(float(human) * rate, 4)
+        out["validation_cost_usd"] = round(n_val * rate, 4)
+        out["total_cost_usd"] = round(
+            out["human_cost_usd"] + float(out["llm_cost_usd"] or 0.0), 4
+        )
+    return out
+
+
+def resolve_llm_model(config: dict[str, Any]) -> dict[str, Any]:
+    """``llm.model: auto`` -> the probe winner in ``<bakeoff.output_dir>/best_llm.json``."""
+    llm_cfg = config.get("llm") or {}
+    if str(llm_cfg.get("model", "")).strip().lower() != "auto":
+        return config
+    from calibral.bakeoff import best_llm_path, configure_bakeoff
+
+    configure_bakeoff(config)
+    path = best_llm_path()
+    if not path.exists():
+        raise FileNotFoundError(
+            f"llm.model=auto but {path} does not exist. Run the LLM probe first."
+        )
+    best = json.loads(path.read_text(encoding="utf-8")).get("best_model")
+    if not best:
+        raise ValueError(f"{path} has no best_model.")
+    config = copy.deepcopy(config)
+    config["llm"]["model"] = best
+    get_logger("experiment").info("llm.model=auto resolved to %s (%s)", best, path)
+    return config
+
+
+# method -> (description, uses LLM)
+METHODS: dict[str, tuple[str, bool]] = {
+    "baseline": ("random AL, humans only", False),
+    "proposed": ("uncertainty AL + calibrated LLM silver labels", True),
+    "random_silver": ("random AL + the same LLM silver mechanism", True),
+    "uncertainty_gold": ("uncertainty AL, humans only (no LLM)", False),
+    "llm_distill": ("LLM labels only, no human training labels", True),
+    "llm_zeroshot": ("LLM predicts the test set directly (no classifier)", True),
+}
+
+
+def _run_al_for_method(
+    method: str,
+    config: dict[str, Any],
+    bundle: DataBundle,
+    *,
+    device: str,
+) -> dict[str, Any]:
+    from calibral.active_learning import (
+        run_baseline_active_learning,
+        run_llm_distill_training,
+        run_llm_zeroshot_test,
+        run_proposed_active_learning,
+    )
+
+    if method == "llm_zeroshot":
+        return run_llm_zeroshot_test(config, bundle)
+    tokenizer = build_tokenizer(str(config.get("model", {}).get("name")))
+    if method == "baseline":
+        return run_baseline_active_learning(config, bundle, tokenizer=tokenizer, device=device)
+    if method == "proposed":
+        return run_proposed_active_learning(config, bundle, tokenizer=tokenizer, device=device)
+    if method == "random_silver":
+        return run_proposed_active_learning(
+            config, bundle, tokenizer=tokenizer, device=device, selection="random"
+        )
+    if method == "uncertainty_gold":
+        return run_proposed_active_learning(
+            config, bundle, tokenizer=tokenizer, device=device, use_llm=False
+        )
+    if method == "llm_distill":
+        return run_llm_distill_training(config, bundle, tokenizer=tokenizer, device=device)
+    raise ValueError(f"Unknown method: {method!r}. Available: {sorted(METHODS)}")
+
+
+def run_method(
+    method: str,
+    config: dict[str, Any],
+    bundle: DataBundle | None = None,
+) -> dict[str, Any]:
+    """Run one method for one seed and append a row to results.csv."""
+    if method not in METHODS:
+        raise ValueError(f"Unknown method: {method!r}. Available: {sorted(METHODS)}")
+    logger = get_logger("experiment")
+    seed = int(config.get("seed", 42))
+    set_seed(seed)
+    device = detect_device()
+    device_desc = describe_device()
+    logger.info("%s start | device=%s | seed=%d", method, device_desc, seed)
+
+    started = time.perf_counter()
+    stamp = datetime.now().strftime("%Y%m%d-%H%M")
+    run_id = (
+        f"{method}_{config.get('profile', 'run')}_seed{seed}_{stamp}_{uuid.uuid4().hex[:6]}"
+    )
+    output_dir = _output_dir(config)
+    uses_llm = METHODS[method][1]
+    llm_mode = str(config.get("llm", {}).get("mode", "unknown")) if uses_llm else "none"
+
+    try:
+        if bundle is None:
+            bundle = prepare_data(config)
+            print_data_summary(bundle)
+        al_result = _run_al_for_method(method, config, bundle, device=device)
+        return _evaluate_and_record(
+            config=config,
+            method=method,
+            run_id=run_id,
+            seed=seed,
+            device_desc=device_desc,
+            bundle=bundle,
+            al_result=al_result,
+            started=started,
+            output_dir=output_dir,
+        )
+    except Exception as exc:
+        runtime_seconds = time.perf_counter() - started
+        logger.exception("%s failed: %s", method, exc)
+        results_path = _append_results_row(
+            output_dir,
+            _failed_row(
+                run_id=run_id,
+                method=method,
+                seed=seed,
+                profile=config.get("profile"),
+                llm_mode=llm_mode,
+                runtime_seconds=runtime_seconds,
+                model_name=str(config.get("model", {}).get("name")),
+                llm_model=str(config.get("llm", {}).get("model")),
+            ),
+        )
+        summary = {
+            "run_id": run_id,
+            "method": method,
+            "seed": seed,
+            "status": "failed",
+            "error": str(exc),
+            "llm_mode": llm_mode,
+            "runtime_seconds": round(runtime_seconds, 3),
+            "results_path": str(results_path),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if _is_smoke_profile(config):
+            summary["result_tag"] = "NOT_SCIENTIFIC_SMOKE_RESULT"
+        _write_summary(output_dir, summary)
+        summary["summary_path"] = str(output_dir / "run_summary.json")
+        return summary
+
+
 def _evaluate_and_record(
     *,
     config: dict[str, Any],
@@ -117,14 +297,17 @@ def _evaluate_and_record(
     train_cfg = config.get("train", {})
     llm_mode = al_result["llm_mode"]
 
-    predictions = predict(
-        al_result["model"],
-        al_result["tokenizer"],
-        bundle.test,
-        device=detect_device(),
-        max_length=int(model_cfg.get("max_length", 128)),
-        batch_size=int(train_cfg.get("batch_size", 8)),
-    )
+    if al_result.get("predictions") is not None:  # e.g. llm_zeroshot
+        predictions = al_result["predictions"]
+    else:
+        predictions = predict(
+            al_result["model"],
+            al_result["tokenizer"],
+            bundle.test,
+            device=detect_device(),
+            max_length=int(model_cfg.get("max_length", 128)),
+            batch_size=int(train_cfg.get("batch_size", 8)),
+        )
     metrics = compute_metrics(
         predictions["true_label"].tolist(),
         predictions["pred_label"].tolist(),
@@ -153,7 +336,23 @@ def _evaluate_and_record(
         "runtime_human": _format_duration(runtime_seconds),
         "llm_mode": llm_mode,
         "status": status,
+        "dataset_name": (config.get("data") or {}).get("dataset_name", "imdb"),
+        "finished_at": datetime.now().isoformat(timespec="seconds"),
+        "n_train": al_result.get("n_train_final"),
+        "gold_labels_total": al_result.get("gold_labels_total"),
+        "silver_labels_total": al_result.get("silver_labels_total"),
+        "silver_label_accuracy": al_result.get("silver_label_accuracy"),
+        "rejected_llm_accuracy": al_result.get("rejected_llm_accuracy"),
+        "llm_selective_coverage": al_result.get("llm_selective_coverage"),
+        "llm_selective_accuracy": al_result.get("llm_selective_accuracy"),
+        **_cost_columns(config, bundle, al_result),
     }
+
+    records = al_result.get("llm_records") or []
+    if records:
+        pd.DataFrame(records).to_csv(
+            output_dir / f"llm_labels_{method}_seed{seed}.csv", index=False
+        )
 
     pred_name = f"predictions_{method}_seed{seed}.csv"
     pred_path = output_dir / pred_name
@@ -190,6 +389,10 @@ def _evaluate_and_record(
         "runtime_human": _format_duration(runtime_seconds),
         "n_train": al_result["n_train_final"],
         "n_test": len(bundle.test),
+        "llm_usage": al_result.get("llm_usage"),
+        "silver_label_accuracy": al_result.get("silver_label_accuracy"),
+        "rejected_llm_accuracy": al_result.get("rejected_llm_accuracy"),
+        "cost": _cost_columns(config, bundle, al_result),
         "rounds": al_result.get("rounds"),
         "initial_train": al_result.get("initial_train"),
         "predictions_path": str(pred_path),
@@ -207,11 +410,12 @@ def _evaluate_and_record(
     summary["summary_path"] = str(summary_path)
     logger.info(
         "%s done | macro_f1=%.4f | human_labels_used=%d | llm_calls=%d | "
-        "llm_mode=%s | runtime=%.2fs",
+        "llm_cost_usd=%s | llm_mode=%s | runtime=%.2fs",
         method,
         metrics["macro_f1"],
         al_result["human_labels_used"],
         al_result["llm_calls"],
+        result_row.get("llm_cost_usd"),
         llm_mode,
         runtime_seconds,
     )
@@ -223,74 +427,7 @@ def run_baseline(
     bundle: DataBundle | None = None,
 ) -> dict[str, Any]:
     """Random active-learning baseline with the same human budget as proposed."""
-    from calibral.active_learning import run_baseline_active_learning
-
-    logger = get_logger("experiment")
-    seed = int(config.get("seed", 42))
-    set_seed(seed)
-    device = detect_device()
-    device_desc = describe_device()
-    logger.info("Baseline start | device=%s | seed=%d", device_desc, seed)
-
-    started = time.perf_counter()
-    run_id = f"baseline_{config.get('profile', 'run')}_seed{seed}_{uuid.uuid4().hex[:8]}"
-    output_dir = _output_dir(config)
-    llm_mode = "none"
-
-    try:
-        if bundle is None:
-            bundle = prepare_data(config)
-            print_data_summary(bundle)
-        tokenizer = build_tokenizer(str(config.get("model", {}).get("name")))
-        al_result = run_baseline_active_learning(
-            config,
-            bundle,
-            tokenizer=tokenizer,
-            device=device,
-        )
-        return _evaluate_and_record(
-            config=config,
-            method="baseline",
-            run_id=run_id,
-            seed=seed,
-            device_desc=device_desc,
-            bundle=bundle,
-            al_result=al_result,
-            started=started,
-            output_dir=output_dir,
-        )
-    except Exception as exc:
-        runtime_seconds = time.perf_counter() - started
-        logger.exception("Baseline failed: %s", exc)
-        results_path = _append_results_row(
-            output_dir,
-            _failed_row(
-                run_id=run_id,
-                method="baseline",
-                seed=seed,
-                profile=config.get("profile"),
-                llm_mode=llm_mode,
-                runtime_seconds=runtime_seconds,
-                model_name=str(config.get("model", {}).get("name")),
-                llm_model=str(config.get("llm", {}).get("model")),
-            ),
-        )
-        summary = {
-            "run_id": run_id,
-            "method": "baseline",
-            "seed": seed,
-            "status": "failed",
-            "error": str(exc),
-            "llm_mode": llm_mode,
-            "runtime_seconds": round(runtime_seconds, 3),
-            "results_path": str(results_path),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if _is_smoke_profile(config):
-            summary["result_tag"] = "NOT_SCIENTIFIC_SMOKE_RESULT"
-        _write_summary(output_dir, summary)
-        summary["summary_path"] = str(output_dir / "run_summary.json")
-        return summary
+    return run_method("baseline", config, bundle)
 
 
 def run_proposed(
@@ -298,84 +435,29 @@ def run_proposed(
     bundle: DataBundle | None = None,
 ) -> dict[str, Any]:
     """Proposed hybrid active-learning method."""
-    from calibral.active_learning import run_proposed_active_learning
-
-    logger = get_logger("experiment")
-    seed = int(config.get("seed", 42))
-    set_seed(seed)
-    device = detect_device()
-    device_desc = describe_device()
-    logger.info("Proposed start | device=%s | seed=%d", device_desc, seed)
-
-    started = time.perf_counter()
-    run_id = f"proposed_{config.get('profile', 'run')}_seed{seed}_{uuid.uuid4().hex[:8]}"
-    output_dir = _output_dir(config)
-    llm_mode = str(config.get("llm", {}).get("mode", "unknown"))
-
-    try:
-        if bundle is None:
-            bundle = prepare_data(config)
-            print_data_summary(bundle)
-        tokenizer = build_tokenizer(str(config.get("model", {}).get("name")))
-        al_result = run_proposed_active_learning(
-            config,
-            bundle,
-            tokenizer=tokenizer,
-            device=device,
-        )
-        return _evaluate_and_record(
-            config=config,
-            method="proposed",
-            run_id=run_id,
-            seed=seed,
-            device_desc=device_desc,
-            bundle=bundle,
-            al_result=al_result,
-            started=started,
-            output_dir=output_dir,
-        )
-    except Exception as exc:
-        runtime_seconds = time.perf_counter() - started
-        logger.exception("Proposed failed: %s", exc)
-        results_path = _append_results_row(
-            output_dir,
-            _failed_row(
-                run_id=run_id,
-                method="proposed",
-                seed=seed,
-                profile=config.get("profile"),
-                llm_mode=llm_mode,
-                runtime_seconds=runtime_seconds,
-                model_name=str(config.get("model", {}).get("name")),
-                llm_model=str(config.get("llm", {}).get("model")),
-            ),
-        )
-        summary = {
-            "run_id": run_id,
-            "method": "proposed",
-            "seed": seed,
-            "status": "failed",
-            "error": str(exc),
-            "llm_mode": llm_mode,
-            "runtime_seconds": round(runtime_seconds, 3),
-            "results_path": str(results_path),
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-        }
-        if _is_smoke_profile(config):
-            summary["result_tag"] = "NOT_SCIENTIFIC_SMOKE_RESULT"
-        _write_summary(output_dir, summary)
-        summary["summary_path"] = str(output_dir / "run_summary.json")
-        return summary
+    return run_method("proposed", resolve_llm_model(config), bundle)
 
 
 def run_comparison(
     config: dict[str, Any],
     *,
-    methods: tuple[str, ...] = ("baseline", "proposed"),
+    methods: tuple[str, ...] | None = None,
     seeds: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Run baseline and proposed on identical splits for one or more seeds."""
+    """Run all methods on identical splits for one or more seeds.
+
+    Methods come from the argument, else ``experiment.methods`` in the config,
+    else (baseline, proposed).
+    """
     logger = get_logger("experiment")
+    config = resolve_llm_model(config)
+    if methods is None:
+        methods = tuple(
+            (config.get("experiment") or {}).get("methods") or ("baseline", "proposed")
+        )
+    unknown = [m for m in methods if m not in METHODS]
+    if unknown:
+        raise ValueError(f"Unknown methods {unknown}. Available: {sorted(METHODS)}")
     if seeds is None:
         seeds = list(config.get("seeds") or [config.get("seed", 42)])
     seeds = [int(s) for s in seeds]
@@ -400,13 +482,7 @@ def run_comparison(
         print_data_summary(bundle)
 
         for method in methods:
-            if method == "baseline":
-                summary = run_baseline(seed_config, bundle=bundle)
-            elif method == "proposed":
-                summary = run_proposed(seed_config, bundle=bundle)
-            else:
-                raise ValueError(f"Unknown method: {method}")
-            run_summaries.append(summary)
+            run_summaries.append(run_method(method, seed_config, bundle=bundle))
 
     comparison = {
         "project": "CalibrAL",
@@ -429,6 +505,7 @@ def run_comparison(
                 "llm_labels_accepted": s.get("llm_labels_accepted"),
                 "llm_calls": s.get("llm_calls"),
                 "llm_mode": s.get("llm_mode"),
+                "cost": s.get("cost"),
                 "result_tag": s.get("result_tag"),
             }
             for s in run_summaries
@@ -456,6 +533,13 @@ def run_comparison(
 
     summary_md = write_experiment_summary(config, output_dir=output_dir)
     comparison["experiment_summary_path"] = str(summary_md)
+    try:
+        from calibral.significance import compute_significance
+
+        compute_significance(output_dir)
+        comparison["significance_path"] = str(output_dir / "significance.md")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Significance computation failed: %s", exc)
 
     n_failed = sum(1 for s in run_summaries if s.get("status") == "failed")
     n_ok = sum(1 for s in run_summaries if s.get("status") == "completed")

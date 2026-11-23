@@ -35,6 +35,9 @@ class DatasetSpec:
     test_split: str
     domain: str
     note: str = ""
+    # Optional mapping of raw label values -> 0/1 (e.g. string labels, or
+    # datasets whose numeric ids are reversed). Stored as pairs (hashable).
+    label_map: tuple[tuple[Any, int], ...] | None = None
 
 
 DATASETS: dict[str, DatasetSpec] = {
@@ -56,6 +59,15 @@ DATASETS: dict[str, DatasetSpec] = {
     "amazon_polarity": DatasetSpec(
         "fancyzhx/amazon_polarity", None, ("title", "content"), "label", "train", "test",
         "product reviews (Amazon)",
+    ),
+    # Persian (Farsi) SnappFood food-delivery comments, 52k/8.3k/9k (the
+    # ParsBERT SnappFood split). CAUTION: its numeric label_id is 0=HAPPY,
+    # 1=SAD (reversed), so labels are mapped from the string column.
+    "snappfood": DatasetSpec(
+        "ParsiAI/snappfood-sentiment-analysis", None, ("comment",), "label",
+        "train", "test", "food-delivery customer comments written in Persian (Farsi)",
+        note="cite ParsBERT (Farahani et al., 2021); use a Persian encoder",
+        label_map=(("HAPPY", 1), ("SAD", 0)),
     ),
     # 8.5k/1k/1k movie-review snippets.
     "rotten_tomatoes": DatasetSpec(
@@ -293,11 +305,18 @@ def load_dataset_frames(
             ". ".join(str(part).strip() for part in parts if str(part or "").strip())
             for parts in zip(*columns)
         ]
+        labels = list(split[spec.label_field])
+        if spec.label_map is not None:
+            mapping = dict(spec.label_map)
+            unknown = sorted({str(v) for v in labels if v not in mapping})
+            if unknown:
+                raise ValueError(f"{spec.hf_id}:{split_name} has unmapped labels {unknown}")
+            labels = [mapping[v] for v in labels]
         frame = pd.DataFrame(
             {
                 "sample_id": [f"{prefix}_{split_name}_{i}" for i in range(len(split))],
                 "text": texts,
-                "label": list(split[spec.label_field]),
+                "label": labels,
             }
         )
         bad = frame[~frame["label"].isin([LABEL_NEGATIVE, LABEL_POSITIVE])]

@@ -24,8 +24,10 @@ def _frames(n_train=200, n_test=50):
 
 
 def test_dataset_registry_has_binary_sets_with_domains():
-    for name in ("imdb", "sst2", "yelp_polarity", "amazon_polarity", "rotten_tomatoes"):
+    for name in ("imdb", "sst2", "yelp_polarity", "amazon_polarity", "rotten_tomatoes", "snappfood"):
         assert dataset_spec(name).domain
+    # SnappFood's numeric ids are reversed: labels must come from the strings.
+    assert dict(dataset_spec("snappfood").label_map) == {"HAPPY": 1, "SAD": 0}
     assert dataset_spec("sst2").test_split == "validation"
     with pytest.raises(ValueError):
         dataset_spec("nope")
@@ -88,7 +90,7 @@ def test_methods_registry_and_paper_configs():
     cfg = load_config("configs/paper_al.yaml")
     assert set(cfg["experiment"]["methods"]) <= set(METHODS)
     assert len(cfg["seeds"]) >= 5
-    for name in ("sst2", "yelp_polarity", "amazon_polarity", "rotten_tomatoes"):
+    for name in ("sst2", "yelp_polarity", "amazon_polarity", "rotten_tomatoes", "snappfood"):
         c = load_config(f"configs/paper/{name}.yaml")
         assert c["data"]["dataset_name"] == name
         assert c["llm"]["model"] == "auto"
@@ -148,3 +150,32 @@ def test_probe_report_renders_winner_and_archive(tmp_path):
     assert (tmp_path / "llm_probe" / "figures" / "probe_accuracy_ci.png").exists()
     hist = list((tmp_path / "llm_probe" / "history").iterdir())
     assert len(hist) == 1 and (hist[0] / "PROBE_REPORT.md").exists()
+
+
+def test_label_map_applied_when_loading(monkeypatch):
+    import datasets
+
+    import calibral.data as D
+
+    fake = datasets.DatasetDict(
+        {
+            "train": datasets.Dataset.from_dict({"comment": ["bad", "good"], "label": ["SAD", "HAPPY"]}),
+            "test": datasets.Dataset.from_dict({"comment": ["meh"], "label": ["SAD"]}),
+        }
+    )
+    monkeypatch.setattr(datasets, "load_dataset", lambda *a, **k: fake)
+    tr, te = D.load_dataset_frames("snappfood", "/tmp/unused_cache")
+    assert tr.set_index("text")["label"].to_dict() == {"bad": 0, "good": 1}
+    assert te["label"].tolist() == [0]
+
+
+def test_snappfood_encoder_ablation_matches_main_config():
+    main = load_config("configs/paper/snappfood.yaml")
+    abl = load_config("configs/paper/snappfood_xlmr.yaml")
+    assert main["model"]["name"] != abl["model"]["name"]
+    assert "xlm-roberta" in abl["model"]["name"]
+    # Only the encoder (and output folder / methods) may differ.
+    for key in ("data", "active_learning", "train", "llm", "seeds", "distill", "cost"):
+        assert main[key] == abl[key], key
+    assert abl["paths"]["output_dir"] != main["paths"]["output_dir"]
+    assert "llm_zeroshot" not in abl["experiment"]["methods"]

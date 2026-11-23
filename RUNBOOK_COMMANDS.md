@@ -43,6 +43,15 @@ python run.py experiment --config configs/paper/amazon_polarity.yaml --seeds 42
 python run.py experiment --config configs/paper/amazon_polarity.yaml --seeds 43,44,45,46
 python run.py report     --config configs/paper/amazon_polarity.yaml
 
+python run.py experiment --config configs/paper/snappfood.yaml --seeds 42
+python run.py experiment --config configs/paper/snappfood.yaml --seeds 43,44,45,46
+python run.py report     --config configs/paper/snappfood.yaml
+
+# 5b · Encoder ablation (Persian: XLM-R instead of ParsBERT)
+python run.py experiment --config configs/paper/snappfood_xlmr.yaml --seeds 42
+python run.py experiment --config configs/paper/snappfood_xlmr.yaml --seeds 43,44,45,46
+python scripts/compare_runs.py outputs/paper_snappfood outputs/paper_snappfood_xlmr
+
 python run.py experiment --config configs/paper/yelp_polarity.yaml --seeds 42
 python run.py experiment --config configs/paper/yelp_polarity.yaml --seeds 43,44,45,46
 python run.py report     --config configs/paper/yelp_polarity.yaml

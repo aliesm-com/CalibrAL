@@ -133,7 +133,8 @@ Fastest first. For each dataset: one seed to measure time, then the rest.
 | 1 | `configs/paper/sst2.yaml` | short sentences, test = 872 |
 | 2 | `configs/paper/rotten_tomatoes.yaml` | small dataset, smaller pool |
 | 3 | `configs/paper/amazon_polarity.yaml` | product reviews, medium length |
-| 4 | `configs/paper/yelp_polarity.yaml` | long reviews, slowest |
+| 4 | `configs/paper/snappfood.yaml` | **Persian** (SnappFood), short comments, ParsBERT encoder, test = 9,033 |
+| 5 | `configs/paper/yelp_polarity.yaml` | long reviews, slowest |
 
 ```powershell
 python run.py experiment --config configs/paper/sst2.yaml --seeds 42
@@ -141,7 +142,24 @@ python run.py experiment --config configs/paper/sst2.yaml --seeds 43,44,45,46
 python run.py report --config configs/paper/sst2.yaml
 ```
 
-- [ ] sst2 · [ ] rotten_tomatoes · [ ] amazon_polarity · [ ] yelp_polarity
+- [ ] sst2 · [ ] rotten_tomatoes · [ ] amazon_polarity · [ ] snappfood · [ ] yelp_polarity
+
+### Step 5b — Encoder ablation (Persian)
+
+SnappFood uses ParsBERT; every other dataset uses roberta-base. To show the conclusions do
+not depend on that choice, re-run SnappFood with the multilingual XLM-RoBERTa encoder
+(same seeds → same splits; same frozen LLM → labels come from the cache, ~no API cost):
+
+```powershell
+python run.py experiment --config configs/paper/snappfood_xlmr.yaml --seeds 42
+python run.py experiment --config configs/paper/snappfood_xlmr.yaml --seeds 43,44,45,46
+python scripts/compare_runs.py outputs/paper_snappfood outputs/paper_snappfood_xlmr
+```
+
+- [ ] snappfood_xlmr done · [ ] comparison table written
+
+✅ **Check:** in the comparison, the sign of Δ vs baseline (and the method ranking) is the
+same for both encoders → "conclusions are robust to the encoder". If it flips, report it.
 
 ✅ **Check:** each `outputs\paper_<dataset>\significance.md` has 5 seeds per method.
 The first run of a new dataset downloads it from Hugging Face (Amazon is large).
@@ -166,7 +184,9 @@ The first run of a new dataset downloads it from Hugging Face (Amazon is large).
 ## Not implemented yet (decide after Step 3)
 
 - [ ] Multi-class datasets (AG News) and a hard one (Yelp-5 / Banking77)
-- [ ] A Persian dataset (low-resource; also reduces the contamination concern)
+- [x] A Persian dataset — `snappfood` (Step 5). Note for the paper: the encoder differs
+      (ParsBERT instead of roberta-base), so compare methods *within* the dataset, not raw
+      F1 across datasets. Cite ParsBERT (Farahani et al., 2021).
 - [ ] Paper 2 ablations: reasoning on vs off; confidence via logprobs / self-consistency;
       re-calibrating LLM confidence on a small gold set
 - [ ] Optional: probe the frozen model on the other datasets (analysis only, not selection)

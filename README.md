@@ -223,6 +223,8 @@ English tables and runtime: `outputs/thesis_al_silver/experiment_summary.md`.
 
 ## Paper protocol (`configs/paper_al.yaml`)
 
+**Step-by-step instructions: [`RUNBOOK_PAPER.md`](RUNBOOK_PAPER.md).**
+
 Same AL protocol as `thesis_al_silver`, with fixes for the paper's LLM comparison.
 Thesis artifacts, the thesis cache, and `prompt_version: v1` are left untouched, so the published thesis numbers stay reproducible.
 
@@ -268,7 +270,8 @@ Set them with `experiment.methods`. Each run writes, besides `results.csv`/predi
 
 ### Other datasets
 
-`data.dataset_name`: `imdb`, `sst2`, `yelp_polarity`, `amazon_polarity`, `rotten_tomatoes`
+`data.dataset_name`: `imdb`, `sst2`, `yelp_polarity`, `amazon_polarity`, `rotten_tomatoes`,
+`snappfood` (Persian; uses the ParsBERT encoder `HooshvareLab/bert-fa-zwnj-base`)
 (binary; the v2 prompt's text domain follows the dataset). Ready configs in `configs/paper/`
 use `llm.model: auto` (the IMDB probe winner):
 
@@ -277,6 +280,7 @@ python run.py experiment --config configs/paper/sst2.yaml
 python run.py experiment --config configs/paper/yelp_polarity.yaml
 python run.py experiment --config configs/paper/amazon_polarity.yaml
 python run.py experiment --config configs/paper/rotten_tomatoes.yaml
+python run.py experiment --config configs/paper/snappfood.yaml
 ```
 
 Per-sample probe answers (with the provider/model OpenRouter actually served) are written to

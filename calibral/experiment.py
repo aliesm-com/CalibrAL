@@ -541,6 +541,13 @@ def run_comparison(
         comparison["significance_path"] = str(output_dir / "significance.md")
     except Exception as exc:  # noqa: BLE001
         logger.warning("Significance computation failed: %s", exc)
+    try:
+        from calibral.experiment_report import build_experiment_report
+
+        path = build_experiment_report(output_dir, config)
+        comparison["experiment_report_path"] = str(path) if path else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("EXPERIMENT_REPORT.md generation failed: %s", exc)
 
     n_failed = sum(1 for s in run_summaries if s.get("status") == "failed")
     n_ok = sum(1 for s in run_summaries if s.get("status") == "completed")

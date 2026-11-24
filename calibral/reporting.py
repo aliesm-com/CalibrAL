@@ -670,6 +670,14 @@ def build_report(
             significance_path = str(output_dir / "significance.md")
     except Exception as exc:  # noqa: BLE001 - stats must never block the report
         logger.warning("Significance computation failed: %s", exc)
+    experiment_report_path = None
+    try:
+        from calibral.experiment_report import build_experiment_report
+
+        path = build_experiment_report(output_dir, config)
+        experiment_report_path = str(path) if path else None
+    except Exception as exc:  # noqa: BLE001 - presentation must never block the report
+        logger.warning("EXPERIMENT_REPORT.md generation failed: %s", exc)
     method_plot = plot_method_comparison(df, comparison_path)
     learning_plot = plot_learning_curve(df, learning_path)
     from calibral.thesis_figures import build_bakeoff_figures, build_experiment_figures, sync_docs_thesis_figures
@@ -710,6 +718,7 @@ def build_report(
         "report_path": str(report_path),
         "experiment_summary_path": str(summary_md_path),
         "significance_path": significance_path,
+        "experiment_report_path": experiment_report_path,
         "results_path": str(results_path),
         "method_comparison_path": str(method_plot) if method_plot else None,
         "learning_curve_path": str(learning_plot) if learning_plot else None,

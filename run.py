@@ -232,6 +232,8 @@ def cmd_experiment(args: argparse.Namespace, config: dict[str, Any]) -> int:
         )
     if comparison.get("significance_path"):
         print(f"significance: {comparison.get('significance_path')}")
+    if comparison.get("experiment_report_path"):
+        print(f"REPORT: {comparison.get('experiment_report_path')}")
     print(f"results: {comparison.get('results_path')}")
     print(f"comparison: {comparison.get('comparison_path')}")
     print(f"experiment_summary: {comparison.get('experiment_summary_path')}")
@@ -252,6 +254,8 @@ def cmd_report(args: argparse.Namespace, config: dict[str, Any]) -> int:
         f"report={result.get('report_path')}"
     )
     print(f"experiment_summary: {result.get('experiment_summary_path')}")
+    if result.get("experiment_report_path"):
+        print(f"REPORT: {result.get('experiment_report_path')}")
     print(f"method_comparison: {result.get('method_comparison_path')}")
     print(f"learning_curve: {result.get('learning_curve_path')}")
     print(f"results: {result.get('results_path')}")

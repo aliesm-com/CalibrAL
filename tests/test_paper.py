@@ -203,3 +203,32 @@ def test_live_cost_excludes_cache_hits():
     ])
     assert usage["llm_cost_usd"] == pytest.approx(1.0)
     assert usage["llm_live_cost_usd"] == pytest.approx(0.5)
+
+
+def test_experiment_report_on_synthetic_runs(tmp_path):
+    from calibral.experiment_report import build_experiment_report
+
+    rng = np.random.default_rng(0)
+    true = rng.integers(0, 2, size=400)
+    rows = []
+    for seed in (1, 2, 3):
+        for method, err in (("baseline", 0.12), ("proposed", 0.06), ("llm_distill", 0.09)):
+            pred = true.copy()
+            flip = rng.random(len(true)) < err
+            pred[flip] = 1 - pred[flip]
+            pd.DataFrame({"sample_id": [f"t{i}" for i in range(len(true))], "true_label": true,
+                          "pred_label": pred}).to_csv(tmp_path / f"predictions_{method}_seed{seed}.csv", index=False)
+            f1 = 1 - err + rng.normal(0, 0.003)
+            rows.append({"method": method, "seed": seed, "status": "completed", "macro_f1": f1,
+                         "model_name": "enc", "llm_model": "llm", "human_labels_used": 0 if method == "llm_distill" else 1500,
+                         "llm_calls": 0 if method == "baseline" else 9000, "n_train": 1500,
+                         "llm_cost_usd": 0.0 if method == "baseline" else 0.4,
+                         "total_cost_usd": 150.0 if method != "llm_distill" else 0.4, "runtime_seconds": 600})
+    pd.DataFrame(rows).to_csv(tmp_path / "results.csv", index=False)
+    out = build_experiment_report(tmp_path, {"data": {"dataset_name": "toy"}})
+    text = (tmp_path / "EXPERIMENT_REPORT.md").read_text(encoding="utf-8")
+    assert out.name.startswith("EXPERIMENT_REPORT_")
+    assert "Best trained classifier" in text and "Head-to-head" in text
+    assert "proposed beats LLM-only distillation" in text
+    assert (tmp_path / "figures" / "report_f1.png").exists()
+    assert len(list((tmp_path / "history").iterdir())) == 1

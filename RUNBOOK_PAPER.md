@@ -7,6 +7,24 @@ until the check passes. Commands are for Windows PowerShell from the project roo
 
 > Status legend: `[ ]` to do · `[x]` done. Tick boxes as you go.
 
+## ⚡ Unattended mode (run everything overnight)
+
+After Steps 0–1, one command runs Steps 2–5b for you:
+
+```powershell
+python scripts/run_paper_all.py --dry-run   # print what will run
+python scripts/run_paper_all.py
+```
+
+- Probe once (skipped if `best_llm.json` exists) → final config → IMDB → SST-2 →
+  Rotten Tomatoes → SnappFood → SnappFood/XLM-R → Amazon → Yelp, all 5 seeds, all methods,
+  then report + figures per dataset and the encoder comparison.
+- **Restart-safe:** stop it any time (Ctrl+C, power cut) and run it again; every
+  (dataset, seed, method) already completed is skipped. A failed run is retried once.
+- Watch progress in `outputs\PAPER_RUN_STATUS.md`; full log in `outputs\paper_run_logs\`.
+- It does **not** stop at the Step 3 decision point — review the IMDB pilot afterwards.
+- `--only imdb,sst2` limits datasets; `--skip-probe` never calls the probe.
+
 ---
 
 ## Step 0 — Environment check (5 min)
@@ -22,7 +40,7 @@ until the check passes. Commands are for Windows PowerShell from the project roo
   git add -A; git commit -m "paper: ablations, cost tracking, probe report"
   ```
 
-✅ **Check:** all tests pass (61 at the time of writing).
+✅ **Check:** all tests pass (63 at the time of writing).
 
 ---
 

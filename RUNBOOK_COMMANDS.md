@@ -2,6 +2,13 @@
 
 Run in order from the project root (PowerShell). Details and checks: `RUNBOOK_PAPER.md`.
 
+**⚡ Everything in one command (unattended)** — runs steps 2–5b in order, skips whatever is
+already done, safe to stop and restart. Progress: `outputs/PAPER_RUN_STATUS.md`.
+```powershell
+python scripts/run_paper_all.py --dry-run   # show the plan first
+python scripts/run_paper_all.py
+```
+
 **0 · Setup**
 ```powershell
 .venv\Scripts\Activate.ps1

@@ -1,7 +1,6 @@
 # Amazon Polarity: product reviews (title + body, shorter texts).
 # Same protocol and methods as configs/paper_al.yaml (IMDB).
-# llm.model: auto = the probe winner from outputs/paper_bakeoff/best_llm.json
-# (run the IMDB probe first). The v2 prompt domain comes from the dataset registry.
+# llm.model = deepseek/deepseek-v4-flash-0731 (best value from the IMDB probe, frozen for all datasets). The v2 prompt domain comes from the dataset registry.
 # Run: python run.py experiment --config configs/paper/amazon_polarity.yaml
 profile: paper_amazon_polarity
 seed: 42
@@ -55,7 +54,7 @@ llm:
   mode: api
   provider: openai_compatible
   base_url: https://openrouter.ai/api/v1
-  model: auto
+  model: deepseek/deepseek-v4-flash-0731
   api_key_env: OPENROUTER_API_KEY
   timeout_seconds: 90
   max_retries: 4

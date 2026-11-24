@@ -17,6 +17,7 @@ from calibral.data import LABEL_NEGATIVE, LABEL_POSITIVE
 from calibral.experiment import run_comparison
 from calibral.llm_labeler import (
     APILLMLabeler,
+    LLMFatalError,
     MissingAPIKeyError,
     _read_api_key,
     api_request_options,
@@ -430,6 +431,8 @@ def run_llm_probe(
                 gold = int(sample["gold_label"])
                 try:
                     result = labeler.label_text(sample["text"])
+                except LLMFatalError:
+                    raise
                 except Exception as exc:  # noqa: BLE001 - count, don't abort model
                     first_error = first_error or str(exc)
                     records.append(
@@ -496,6 +499,8 @@ def run_llm_probe(
                     **_calibration_metrics(records),
                 }
             )
+        except LLMFatalError:
+            raise
         except Exception as exc:  # noqa: BLE001 — record per-model failure
             row["status"] = "failed"
             row["error"] = str(exc)

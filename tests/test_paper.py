@@ -93,7 +93,8 @@ def test_methods_registry_and_paper_configs():
     for name in ("sst2", "yelp_polarity", "amazon_polarity", "rotten_tomatoes", "snappfood"):
         c = load_config(f"configs/paper/{name}.yaml")
         assert c["data"]["dataset_name"] == name
-        assert c["llm"]["model"] == "auto"
+        # One frozen LLM for every dataset (no per-dataset selection).
+        assert c["llm"]["model"] == load_config("configs/paper_al_final.yaml")["llm"]["model"]
 
 
 def test_resolve_llm_model_auto(tmp_path):
@@ -179,3 +180,26 @@ def test_snappfood_encoder_ablation_matches_main_config():
         assert main[key] == abl[key], key
     assert abl["paths"]["output_dir"] != main["paths"]["output_dir"]
     assert "llm_zeroshot" not in abl["experiment"]["methods"]
+
+
+def test_out_of_credit_is_fatal_not_routed_to_humans():
+    from calibral.llm_labeler import APILLMLabeler, LLMFatalError, LLMLabelError
+
+    lab = APILLMLabeler(base_url="https://openrouter.ai/api/v1", model="m", api_key="k",
+                        max_retries=3, concurrency=2)
+
+    def post(body):
+        raise LLMLabelError('HTTP 402 from LLM API: {"error": "Insufficient credits"}')
+
+    lab._post = post
+    with pytest.raises(LLMFatalError):
+        lab.label_many(["a", "b", "c"])
+
+
+def test_live_cost_excludes_cache_hits():
+    usage = summarize_llm_usage([
+        LLMLabelResult("positive", 0.9, "api", source="api", prompt_tokens=10, cost_usd=0.5),
+        LLMLabelResult("positive", 0.9, "api", cached=True, source="cache", prompt_tokens=10, cost_usd=0.5),
+    ])
+    assert usage["llm_cost_usd"] == pytest.approx(1.0)
+    assert usage["llm_live_cost_usd"] == pytest.approx(0.5)

@@ -156,6 +156,16 @@ class LLMLabelError(Exception):
     """Raised when labeling fails after retries or validation."""
 
 
+class LLMFatalError(RuntimeError):
+    """Account-level API failure (no credit, bad key): stop the run immediately.
+
+    Deliberately NOT an ``LLMLabelError`` so ``label_many`` does not turn it
+    into a low-confidence answer routed to the human oracle, which would
+    silently change the experiment (e.g. ``proposed`` becoming all-human).
+    The message starts with ``LLM_FATAL`` so the batch runner can detect it.
+    """
+
+
 class MissingAPIKeyError(LLMLabelError):
     """Raised when a scientific/API run requires a key that is absent."""
 
@@ -507,6 +517,12 @@ class APILLMLabeler(BaseLLMLabeler):
                     cost_usd=meta.get("cost_usd"),
                 )
             except Exception as exc:  # noqa: BLE001 - retry transient/API/parse errors
+                text = str(exc)
+                if text.startswith(("HTTP 402", "HTTP 401", "HTTP 403")):
+                    raise LLMFatalError(
+                        f"LLM_FATAL {text[:200]} — out of OpenRouter credit or invalid key. "
+                        "Top up / fix the key, then re-run: completed runs are skipped."
+                    ) from exc
                 last_error = exc
                 self.logger.warning(
                     "API label attempt %d/%d failed: %s: %s",
@@ -835,6 +851,8 @@ def summarize_llm_usage(
         "llm_completion_tokens": 0,
         "llm_reasoning_tokens": 0,
         "llm_cost_usd": 0.0,
+        # Money actually spent in this run (live API calls only, no cache hits).
+        "llm_live_cost_usd": 0.0,
         "llm_cost_known_calls": 0,
         "llm_cost_estimated_calls": 0,
         "llm_cost_unknown_calls": 0,
@@ -848,6 +866,8 @@ def summarize_llm_usage(
         if r.cost_usd is not None:
             out["llm_cost_usd"] += float(r.cost_usd)
             out["llm_cost_known_calls"] += 1
+            if r.source == "api":
+                out["llm_live_cost_usd"] += float(r.cost_usd)
         elif (
             r.prompt_tokens is not None
             and price_per_million_input is not None
@@ -861,6 +881,7 @@ def summarize_llm_usage(
         else:
             out["llm_cost_unknown_calls"] += 1
     out["llm_cost_usd"] = round(out["llm_cost_usd"], 6)
+    out["llm_live_cost_usd"] = round(out["llm_live_cost_usd"], 6)
     return out
 
 

@@ -124,6 +124,7 @@ def _cost_columns(
         "llm_completion_tokens": usage.get("llm_completion_tokens"),
         "llm_reasoning_tokens": usage.get("llm_reasoning_tokens"),
         "llm_cost_usd": llm_cost if usage else 0.0,
+        "llm_live_cost_usd": usage.get("llm_live_cost_usd", 0.0) if usage else 0.0,
         "llm_cost_unknown_calls": usage.get("llm_cost_unknown_calls"),
         "human_cost_usd": None,
         "validation_cost_usd": None,
